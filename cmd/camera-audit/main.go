@@ -15,6 +15,7 @@ import (
 	"xkem.am/camera-audit/internal/gateway"
 	"xkem.am/camera-audit/internal/mqttpub"
 	"xkem.am/camera-audit/internal/store"
+	"xkem.am/camera-audit/internal/telegram"
 )
 
 func main() {
@@ -58,6 +59,8 @@ func main() {
 	defer publisher.Close()
 	manager.SetObserver(publisher.Set)
 	manager.SetAvailabilityObserver(publisher.SetAvailable)
+	notifier := telegram.New(cfg.Telegram, cfg.Timezone, log)
+	manager.SetRecordingObserver(notifier.Add)
 
 	handler, err := gateway.New(cfg, manager, s, log)
 	if err != nil {
@@ -66,6 +69,12 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	notifierCtx, stopNotifier := context.WithCancel(context.Background())
+	notifierDone := make(chan struct{})
+	go func() {
+		defer close(notifierDone)
+		notifier.Run(notifierCtx)
+	}()
 	managerDone := make(chan struct{})
 	go func() {
 		defer close(managerDone)
@@ -91,4 +100,6 @@ func main() {
 	defer cancel()
 	_ = server.Shutdown(shutdown)
 	<-managerDone
+	stopNotifier()
+	<-notifierDone
 }

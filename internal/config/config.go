@@ -48,6 +48,13 @@ type MQTT struct {
 	DiscoveryPrefix string `yaml:"discovery_prefix"`
 }
 
+type Telegram struct {
+	Enabled     bool     `yaml:"enabled"`
+	BotToken    string   `yaml:"bot_token"`
+	ChatID      string   `yaml:"chat_id"`
+	BatchWindow Duration `yaml:"batch_window"`
+}
+
 type Config struct {
 	Listen                       string   `yaml:"listen"`
 	FrigateURL                   string   `yaml:"frigate_url"`
@@ -70,6 +77,7 @@ type Config struct {
 	BirdseyeCameras              []string `yaml:"birdseye_cameras"`
 	Rules                        []Rule   `yaml:"rules"`
 	MQTT                         MQTT     `yaml:"mqtt"`
+	Telegram                     Telegram `yaml:"telegram"`
 }
 
 func Load(path string) (Config, error) {
@@ -92,6 +100,7 @@ func Load(path string) (Config, error) {
 			TopicPrefix:     "camera_audit",
 			DiscoveryPrefix: "homeassistant",
 		},
+		Telegram: Telegram{BatchWindow: Duration(5 * time.Minute)},
 	}
 	decoder := yaml.NewDecoder(bytes.NewReader(b))
 	decoder.KnownFields(true)
@@ -158,6 +167,14 @@ func Load(path string) (Config, error) {
 		if strings.TrimSpace(c.MQTT.Broker) == "" || strings.TrimSpace(c.MQTT.ClientID) == "" ||
 			strings.TrimSpace(c.MQTT.TopicPrefix) == "" || strings.TrimSpace(c.MQTT.DiscoveryPrefix) == "" {
 			return Config{}, fmt.Errorf("enabled MQTT requires broker, client_id, topic_prefix, and discovery_prefix")
+		}
+	}
+	if c.Telegram.Enabled {
+		if strings.TrimSpace(c.Telegram.BotToken) == "" || strings.TrimSpace(c.Telegram.ChatID) == "" {
+			return Config{}, fmt.Errorf("enabled Telegram notifications require bot_token and chat_id")
+		}
+		if c.Telegram.BatchWindow.Value() <= 0 {
+			return Config{}, fmt.Errorf("telegram batch_window must be greater than zero")
 		}
 	}
 	return c, nil

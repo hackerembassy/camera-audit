@@ -18,7 +18,7 @@ func TestLoadDefaultsAndEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != ":8080" || c.Timezone != "UTC" || c.SnapshotLease.Value().Seconds() != 75 || c.Database == "${TEST_DB}" {
+	if c.Listen != ":8080" || c.Timezone != "UTC" || c.SnapshotLease.Value().Seconds() != 75 || c.Telegram.BatchWindow.Value().Minutes() != 5 || c.Database == "${TEST_DB}" {
 		t.Fatalf("defaults or expansion missing: %#v", c)
 	}
 }
@@ -118,6 +118,22 @@ func TestLoadRejectsIncompleteEnabledMQTT(t *testing.T) {
 	}
 	if _, err := Load(p); err == nil {
 		t.Fatal("expected incomplete enabled MQTT configuration to be rejected")
+	}
+}
+
+func TestLoadValidatesEnabledTelegram(t *testing.T) {
+	for _, telegram := range []string{
+		"telegram:\n  enabled: true\n",
+		"telegram:\n  enabled: true\n  bot_token: token\n  chat_id: chat\n  batch_window: 0s\n",
+	} {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		data := []byte("frigate_url: https://frigate:8971\ngo2rtc_url: http://frigate:1984\ndatabase: audit.db\ntrusted_proxies: [127.0.0.0/8]\n" + telegram)
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "Telegram") && !strings.Contains(err.Error(), "telegram") {
+			t.Fatalf("Load() error=%v, want Telegram validation error", err)
+		}
 	}
 }
 

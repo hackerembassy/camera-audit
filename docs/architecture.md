@@ -49,6 +49,7 @@ browser / Home Assistant
 | `internal/gateway` | Authentik trust boundary, Frigate reverse proxy, route recognition, WebSocket relay, dashboard, JSON API, and CSV export. |
 | `internal/go2rtc` | Bounded, authenticated reads of `/api/streams` and the diagnostic DOT graph. |
 | `internal/audit` | In-memory reconciliation, identity classification/correlation, leases, Birdseye layout, privacy state, and retention scheduling. |
+| `internal/telegram` | Delayed, grouped Telegram summaries for newly started recording playback leases. |
 | `internal/store` | SQLite schema, lifecycle writes, history queries, startup recovery, and pruning. |
 | `internal/mqttpub` | MQTT discovery, retained state, availability, reconnect recovery, and shutdown cleanup. |
 | `internal/model` | Data transferred between the manager, store, gateway, and JSON clients. |

@@ -14,6 +14,8 @@
 
 Historical recording playback is audited but does not activate privacy alerts. Review thumbnails, event snapshots, and downloaded clips that do not pass through a recognized playback route also remain non-alerting.
 
+Optional Telegram notifications summarize newly started recording playback leases after a configurable delay. Segment refreshes only renew an existing lease, and all distinct playback starts during the delay are delivered as one message, avoiding one notification per request.
+
 ## Identity limits
 
 Frigate browser requests passing through Authentik have an exact username. WebRTC media bypasses the HTTP gateway after signaling, so its go2rtc session is marked `correlated`. The standard Home Assistant Frigate integration calls Frigate using shared backend credentials and does not pass the HA user; those accesses are deliberately recorded as `Home Assistant`.
@@ -68,6 +70,10 @@ names that slug identically (or contain only non-ASCII characters) remain
 distinct. On upgrade, the daemon removes retained discovery entries created by
 the older plain-slug format. If the broker is unavailable at startup, auditing
 and proxying still start while the MQTT client reconnects in the background.
+
+## Telegram recording summaries
+
+Create a bot with BotFather, add it to the target chat, and configure `telegram.enabled`, `bot_token`, `chat_id`, and `batch_window`. Keep the token in `CAMERA_AUDIT_TELEGRAM_BOT_TOKEN` rather than committing it. A five-minute window is the default. Each message groups identical actor, camera, route detail, and protocol combinations and reports their counts. Delivery failures are logged and the pending batch is retried; a graceful shutdown makes one final delivery attempt.
 
 ## Local development
 

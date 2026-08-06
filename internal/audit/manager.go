@@ -50,6 +50,7 @@ type birdseyeControl struct {
 
 type PrivacyObserver func(camera string, active bool)
 type AvailabilityObserver func(available bool)
+type RecordingObserver func(event model.Event)
 
 type Manager struct {
 	mu sync.RWMutex
@@ -75,6 +76,7 @@ type Manager struct {
 	dot                  string
 	observer             PrivacyObserver
 	availabilityObserver AvailabilityObserver
+	recordingObserver    RecordingObserver
 }
 
 func New(cfg config.Config, s *store.Store, log *slog.Logger) (*Manager, error) {
@@ -108,6 +110,12 @@ func (m *Manager) SetObserver(fn PrivacyObserver) {
 func (m *Manager) SetAvailabilityObserver(fn AvailabilityObserver) {
 	m.mu.Lock()
 	m.availabilityObserver = fn
+	m.mu.Unlock()
+}
+
+func (m *Manager) SetRecordingObserver(fn RecordingObserver) {
+	m.mu.Lock()
+	m.recordingObserver = fn
 	m.mu.Unlock()
 }
 
@@ -468,7 +476,12 @@ func (m *Manager) StartHTTP(ctx context.Context, kind, camera, details, actor, a
 			return 0
 		}
 		m.leases[leaseKey] = activityLease{eventID: id, camera: camera, suppressed: suppressed, privacy: leasePrivacy, expires: now.Add(leaseDuration)}
+		recordingObserver := m.recordingObserver
 		m.mu.Unlock()
+		if kind == "recording_playback" && recordingObserver != nil {
+			e.ID = id
+			recordingObserver(e)
+		}
 		return 0
 	}
 	id, err := m.store.Start(ctx, e)

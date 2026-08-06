@@ -141,6 +141,8 @@ func TestRecordingPlaybackIsLeasedWithoutPrivacyAlert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var notified []model.Event
+	m.SetRecordingObserver(func(event model.Event) { notified = append(notified, event) })
 	now := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
 	if id := m.StartHTTP(context.Background(), "recording_playback", "workshop", "start=100 end=200", "alice", "person", "exact", "hls", "192.0.2.1", "browser", now); id != 0 {
 		t.Fatalf("leased playback returned event id %d", id)
@@ -152,6 +154,9 @@ func TestRecordingPlaybackIsLeasedWithoutPrivacyAlert(t *testing.T) {
 
 	touched := now.Add(30 * time.Second)
 	m.StartHTTP(context.Background(), "recording_playback", "workshop", "start=100 end=200", "alice", "person", "exact", "hls", "192.0.2.1", "browser", touched)
+	if len(notified) != 1 || notified[0].Actor != "alice" || notified[0].Camera != "workshop" || notified[0].ID == 0 {
+		t.Fatalf("recording notifications=%#v, want one logical playback", notified)
+	}
 	events, err := s.RecentFrigate(context.Background(), 10, "")
 	if err != nil {
 		t.Fatal(err)
