@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,7 +61,7 @@ func TestCameraAccess(t *testing.T) {
 	}
 }
 
-func TestBatchExportInspectionRestoresBodyAndOmitsFreeText(t *testing.T) {
+func TestBatchExportInspectionRestoresBodyAndKeepsOnlyExplicitFriendlyName(t *testing.T) {
 	body := `{"items":[{"camera":"workshop","start_time":100.5,"end_time":200,"friendly_name":"private incident name"},{"camera":"hall","start_time":300,"end_time":400,"client_item_id":"opaque-secret"}],"new_case_name":"private case"}`
 	request := httptest.NewRequest(http.MethodPost, "http://x/api/exports/batch", strings.NewReader(body))
 	accesses := requestAccesses(request)
@@ -74,14 +75,40 @@ func TestBatchExportInspectionRestoresBodyAndOmitsFreeText(t *testing.T) {
 	if len(accesses) != 2 {
 		t.Fatalf("accesses=%#v", accesses)
 	}
-	if accesses[0].camera != "workshop" || accesses[0].details != "mode=batch item=1/2 start=100.5 end=200" ||
+	if accesses[0].camera != "workshop" || accesses[0].details != "mode=batch item=1/2 start=100.5 end=200 export_name=private incident name" ||
 		accesses[1].camera != "hall" || accesses[1].details != "mode=batch item=2/2 start=300 end=400" {
 		t.Fatalf("unexpected batch metadata: %#v", accesses)
 	}
 	for _, access := range accesses {
-		if strings.Contains(access.details, "private") || strings.Contains(access.details, "secret") {
+		if strings.Contains(access.details, "private case") || strings.Contains(access.details, "secret") {
 			t.Fatalf("free text leaked into audit details: %#v", access)
 		}
+	}
+}
+
+func TestSingleExportInspectionRestoresBodyAndKeepsFriendlyName(t *testing.T) {
+	body := `{"name":"Doorbell package delivery","ffmpeg_input_args":"not audited"}`
+	request := httptest.NewRequest(http.MethodPost, "http://x/api/export/doorbell/start/100/end/200", strings.NewReader(body))
+	accesses := requestAccesses(request)
+	restored, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != body {
+		t.Fatalf("request body changed: %q", restored)
+	}
+	if len(accesses) != 1 || accesses[0].details != "mode=standard start=100 end=200 export_name=Doorbell package delivery" {
+		t.Fatalf("accesses=%#v", accesses)
+	}
+}
+
+func TestExportFileIdentity(t *testing.T) {
+	camera, exportID, ok := exportFileIdentity("doorbell_20260806_222434-20260806_222507_m8y925.mp4")
+	if !ok || camera != "doorbell" || exportID != "doorbell_m8y925" {
+		t.Fatalf("camera=%q exportID=%q ok=%v", camera, exportID, ok)
+	}
+	if _, _, ok := exportFileIdentity("arbitrary.mp4"); ok {
+		t.Fatal("accepted a non-Frigate export filename")
 	}
 }
 
@@ -537,6 +564,77 @@ func TestAuthenticatedBatchExportsAreAuditedPerCameraAndBodyIsPreserved(t *testi
 	}
 	if !cameras["workshop"] || !cameras["hall"] || manager.Current().Privacy["workshop"] || manager.Current().Privacy["hall"] {
 		t.Fatalf("cameras=%v privacy=%v", cameras, manager.Current().Privacy)
+	}
+}
+
+func TestExportDownloadInfersCameraAndResolvesFriendlyName(t *testing.T) {
+	const filename = "doorbell_20260806_222434-20260806_222507_m8y925.mp4"
+	var metadataCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/exports/doorbell_m8y925":
+			metadataCalls.Add(1)
+			if r.Header.Get("X-authentik-username") != "dipierro" {
+				http.Error(w, "missing identity", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"camera":"doorbell","name":"Package at the front door"}`))
+		case "/exports/" + filename:
+			_, _ = w.Write([]byte("video"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	auditStore, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer auditStore.Close()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.Config{
+		FrigateURL: upstream.URL, IdentityHeader: "X-authentik-username",
+		TrustedProxies: []string{"127.0.0.0/8"}, ActivityWindow: config.Duration(time.Minute),
+	}
+	manager, err := audit.New(cfg, auditStore, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(cfg, manager, auditStore, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(gateway)
+	defer server.Close()
+
+	for range 2 {
+		request, err := http.NewRequest(http.MethodGet, server.URL+"/exports/"+filename, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("X-authentik-username", "dipierro")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("status=%s", response.Status)
+		}
+	}
+
+	events, err := auditStore.RecentRecordings(context.Background(), 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Camera != "doorbell" || events[0].Actor != "dipierro" ||
+		events[0].Details != "export_file="+filename+" export_name=Package at the front door" {
+		t.Fatalf("events=%#v", events)
+	}
+	if got := metadataCalls.Load(); got != 1 {
+		t.Fatalf("metadata calls=%d, want one cached lookup", got)
 	}
 }
 

@@ -160,8 +160,12 @@ func (n *Notifier) message(events []model.Event) string {
 		if key.protocol != "" {
 			line += " · <code>" + html.EscapeString(clean(key.protocol)) + "</code>"
 		}
-		if key.details != "" {
-			line += "\n  <code>" + html.EscapeString(clean(key.details)) + "</code>"
+		details, exportName := exportNameFromDetails(key.details)
+		if exportName != "" {
+			line += "\n  <i>“" + html.EscapeString(clean(exportName)) + "”</i>"
+		}
+		if details != "" {
+			line += "\n  <code>" + html.EscapeString(clean(details)) + "</code>"
 		}
 		if counts[key] > 1 {
 			line += fmt.Sprintf(" <b>×%d</b>", counts[key])
@@ -173,6 +177,17 @@ func (n *Notifier) message(events []model.Event) string {
 		b.WriteString(line)
 	}
 	return b.String()
+}
+
+func exportNameFromDetails(details string) (string, string) {
+	const marker = " export_name="
+	if index := strings.Index(details, marker); index >= 0 {
+		return details[:index], details[index+len(marker):]
+	}
+	if strings.HasPrefix(details, "export_name=") {
+		return "", strings.TrimPrefix(details, "export_name=")
+	}
+	return details, ""
 }
 
 func actionLabel(kind string) string {

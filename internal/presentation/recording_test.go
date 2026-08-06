@@ -32,6 +32,13 @@ func TestRecordingDetailsShowsBothDatesAcrossMidnight(t *testing.T) {
 	}
 }
 
+func TestRecordingDetailsKeepsFriendlyNameOutOfRangeParsing(t *testing.T) {
+	details := "start=1786001400 end=1786002300 export_name=Delivery start=1 end=2"
+	if got, want := RecordingDetails(details, time.UTC), "range=2026-08-06 07:30–07:45 +00 export_name=Delivery start=1 end=2"; got != want {
+		t.Fatalf("RecordingDetails()=%q, want %q", got, want)
+	}
+}
+
 func TestRecordingDetailsPreservesUnknownMetadata(t *testing.T) {
 	for _, details := range []string{"event=abc", "start=invalid end=123", "start=123"} {
 		if got := RecordingDetails(details, time.UTC); got != details {

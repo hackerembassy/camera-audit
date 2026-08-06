@@ -10,7 +10,8 @@ import (
 // RecordingDetails replaces Frigate's Unix start/end values with a compact,
 // minute-level local range. Unrecognized details are returned unchanged.
 func RecordingDetails(details string, location *time.Location) string {
-	fields := strings.Fields(details)
+	rangeDetails, exportName := splitExportName(details)
+	fields := strings.Fields(rangeDetails)
 	startIndex, endIndex := -1, -1
 	var start, end time.Time
 	for index, field := range fields {
@@ -49,7 +50,19 @@ func RecordingDetails(details string, location *time.Location) string {
 			out = append(out, field)
 		}
 	}
-	return strings.Join(out, " ")
+	formatted := strings.Join(out, " ")
+	if exportName != "" {
+		formatted += " export_name=" + exportName
+	}
+	return formatted
+}
+
+func splitExportName(details string) (string, string) {
+	const marker = " export_name="
+	if index := strings.Index(details, marker); index >= 0 {
+		return details[:index], details[index+len(marker):]
+	}
+	return details, ""
 }
 
 func unixSeconds(value string) (time.Time, bool) {

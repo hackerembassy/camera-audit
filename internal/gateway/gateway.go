@@ -18,9 +18,11 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"xkem.am/camera-audit/internal/audit"
@@ -35,11 +37,21 @@ type Gateway struct {
 	manager  *audit.Manager
 	store    *store.Store
 	proxy    *httputil.ReverseProxy
+	metadata *http.Client
 	target   *url.URL
 	tls      *tls.Config
 	location *time.Location
 	trusted  []netip.Prefix
 	log      *slog.Logger
+
+	exportMu    sync.Mutex
+	exportCache map[string]cachedExportMetadata
+}
+
+type cachedExportMetadata struct {
+	camera, name string
+	found        bool
+	expires      time.Time
 }
 
 func New(cfg config.Config, manager *audit.Manager, store *store.Store, log *slog.Logger) (*Gateway, error) {
@@ -68,7 +80,18 @@ func New(cfg config.Config, manager *audit.Manager, store *store.Store, log *slo
 		log.Error("Frigate proxy", "error", err, "path", r.URL.Path)
 		http.Error(w, "Frigate upstream unavailable", http.StatusBadGateway)
 	}
-	g := &Gateway{cfg: cfg, manager: manager, store: store, proxy: p, target: target, tls: tlsConfig, location: location, log: log}
+	metadataClient := &http.Client{
+		Transport: transport,
+		Timeout:   2 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	g := &Gateway{
+		cfg: cfg, manager: manager, store: store, proxy: p, metadata: metadataClient,
+		target: target, tls: tlsConfig, location: location, log: log,
+		exportCache: make(map[string]cachedExportMetadata),
+	}
 	for _, raw := range cfg.TrustedProxies {
 		prefix, _ := netip.ParsePrefix(raw)
 		g.trusted = append(g.trusted, prefix)
@@ -142,6 +165,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accesses := requestAccesses(r)
+	g.enrichExportDownloads(r, accesses, now)
 	eventIDs := make([]int64, 0, len(accesses))
 	for _, access := range accesses {
 		eventID := g.manager.StartHTTP(r.Context(), access.kind, access.camera, access.details, actor, actorType, confidence, access.protocol, remote, ua, now)
@@ -211,7 +235,13 @@ func requestAccesses(r *http.Request) []httpAccess {
 	if kind == "" {
 		return nil
 	}
-	return []httpAccess{{kind: kind, camera: camera, protocol: protocol, details: details}}
+	access := httpAccess{kind: kind, camera: camera, protocol: protocol, details: details}
+	if kind == "recording_export_requested" {
+		if name := singleExportFriendlyName(r); name != "" {
+			access.details += " export_name=" + name
+		}
+	}
+	return []httpAccess{access}
 }
 
 func cameraAccess(r *http.Request) (kind, camera, protocol, details string) {
@@ -296,9 +326,10 @@ func batchExportAccesses(r *http.Request) []httpAccess {
 	}
 	var body struct {
 		Items []struct {
-			Camera    string  `json:"camera"`
-			StartTime float64 `json:"start_time"`
-			EndTime   float64 `json:"end_time"`
+			Camera       string  `json:"camera"`
+			StartTime    float64 `json:"start_time"`
+			EndTime      float64 `json:"end_time"`
+			FriendlyName string  `json:"friendly_name"`
 		} `json:"items"`
 	}
 	if json.Unmarshal(prefix, &body) != nil || len(body.Items) == 0 || len(body.Items) > maxBatchExportItems {
@@ -306,13 +337,123 @@ func batchExportAccesses(r *http.Request) []httpAccess {
 	}
 	accesses := make([]httpAccess, 0, len(body.Items))
 	for index, item := range body.Items {
+		details := fmt.Sprintf("mode=batch item=%d/%d start=%s end=%s", index+1, len(body.Items),
+			strconv.FormatFloat(item.StartTime, 'f', -1, 64), strconv.FormatFloat(item.EndTime, 'f', -1, 64))
+		if name := auditToken(item.FriendlyName); name != "" {
+			details += " export_name=" + name
+		}
 		accesses = append(accesses, httpAccess{
 			kind: "recording_export_requested", camera: auditToken(item.Camera), protocol: "http",
-			details: fmt.Sprintf("mode=batch item=%d/%d start=%s end=%s", index+1, len(body.Items),
-				strconv.FormatFloat(item.StartTime, 'f', -1, 64), strconv.FormatFloat(item.EndTime, 'f', -1, 64)),
+			details: details,
 		})
 	}
 	return accesses
+}
+
+func singleExportFriendlyName(r *http.Request) string {
+	if r.Body == nil {
+		return ""
+	}
+	original := r.Body
+	prefix, err := io.ReadAll(io.LimitReader(original, maxInspectedExportBody+1))
+	r.Body = replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), original), Closer: original}
+	if err != nil || len(prefix) > maxInspectedExportBody {
+		return ""
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(prefix, &body) != nil {
+		return ""
+	}
+	return auditToken(body.Name)
+}
+
+var exportFilenamePattern = regexp.MustCompile(`^(.+)_\d{8}_\d{6}-\d{8}_\d{6}_([a-z0-9]{6})\.mp4$`)
+
+func exportFileIdentity(filename string) (camera, exportID string, ok bool) {
+	matches := exportFilenamePattern.FindStringSubmatch(path.Base(filename))
+	if len(matches) != 3 {
+		return "", "", false
+	}
+	camera = auditToken(matches[1])
+	return camera, camera + "_" + matches[2], camera != ""
+}
+
+func (g *Gateway) enrichExportDownloads(r *http.Request, accesses []httpAccess, now time.Time) {
+	for index := range accesses {
+		access := &accesses[index]
+		if access.kind != "recording_export_download" || access.protocol != "http" || !strings.HasPrefix(access.details, "export_file=") {
+			continue
+		}
+		filename := strings.TrimPrefix(access.details, "export_file=")
+		camera, exportID, ok := exportFileIdentity(filename)
+		if !ok {
+			continue
+		}
+		access.camera = camera
+		metadata := g.cachedExportMetadata(r, exportID, now)
+		if metadata.found {
+			if metadata.camera != "" {
+				access.camera = metadata.camera
+			}
+			if metadata.name != "" {
+				access.details += " export_name=" + metadata.name
+			}
+		}
+	}
+}
+
+func (g *Gateway) cachedExportMetadata(r *http.Request, exportID string, now time.Time) cachedExportMetadata {
+	g.exportMu.Lock()
+	if cached, ok := g.exportCache[exportID]; ok && now.Before(cached.expires) {
+		g.exportMu.Unlock()
+		return cached
+	}
+	g.exportMu.Unlock()
+
+	metadata := g.fetchExportMetadata(r, exportID)
+	metadata.expires = now.Add(5 * time.Minute)
+	g.exportMu.Lock()
+	g.exportCache[exportID] = metadata
+	g.exportMu.Unlock()
+	return metadata
+}
+
+func (g *Gateway) fetchExportMetadata(r *http.Request, exportID string) cachedExportMetadata {
+	metadataURL := *g.target
+	metadataURL.Path = strings.TrimRight(g.target.Path, "/") + "/api/exports/" + exportID
+	metadataURL.RawPath = ""
+	metadataURL.RawQuery = ""
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, metadataURL.String(), nil)
+	if err != nil {
+		return cachedExportMetadata{}
+	}
+	request.Header = r.Header.Clone()
+	for _, header := range []string{"Accept-Encoding", "Content-Length", "Content-Type", "If-Match", "If-Modified-Since", "If-None-Match", "If-Unmodified-Since", "Range"} {
+		request.Header.Del(header)
+	}
+	request.Header.Set("Accept", "application/json")
+	if g.cfg.FrigateProxySecret != "" {
+		request.Header.Set("X-Proxy-Secret", g.cfg.FrigateProxySecret)
+	}
+	response, err := g.metadata.Do(request)
+	if err != nil {
+		g.log.Debug("Frigate export metadata lookup", "error", err, "export_id", exportID)
+		return cachedExportMetadata{}
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return cachedExportMetadata{}
+	}
+	var body struct {
+		Camera string `json:"camera"`
+		Name   string `json:"name"`
+	}
+	if json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&body) != nil {
+		return cachedExportMetadata{}
+	}
+	return cachedExportMetadata{camera: auditToken(body.Camera), name: auditToken(body.Name), found: true}
 }
 
 func auditToken(value string) string {
