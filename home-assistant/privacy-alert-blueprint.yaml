@@ -1,0 +1,24 @@
+blueprint:
+  name: Announce active camera viewer in a room
+  description: >-
+    Runs an action once when an unsuppressed viewer begins viewing a camera.
+    The camera-audit MQTT entity contains state only and discloses no viewer identity.
+  domain: automation
+  input:
+    viewer_sensor:
+      name: Camera external-viewer sensor
+      selector:
+        entity:
+          domain: binary_sensor
+    notification_actions:
+      name: Room notification actions
+      selector:
+        action: {}
+
+mode: single
+triggers:
+  - trigger: state
+    entity_id: !input viewer_sensor
+    from: "off"
+    to: "on"
+actions: !input notification_actions

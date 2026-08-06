@@ -1,0 +1,59 @@
+listen: ":8080"
+
+# Authentik sends users here. The daemon forwards non-/audit paths to Frigate.
+frigate_url: "http://frigate:8971"
+
+# Base of Frigate's protected proxy for the bundled go2rtc API. The daemon adds
+# /streams and /streams.dot.
+go2rtc_url: "http://frigate:5000/api/go2rtc"
+database: "/data/audit.db"
+
+identity_header: "X-authentik-username"
+trusted_proxies:
+  - "172.18.0.0/16"
+
+poll_interval: 2s
+activity_window: 5m
+snapshot_lease: 75s
+privacy_clear_delay: 30s
+retention: 8760h # 365 days
+
+# A Birdseye viewer conservatively activates every camera listed here.
+birdseye_cameras:
+  - workshop
+  - electronics_room
+
+# First matching rule wins. Suppressed connections are retained in history but
+# do not activate room privacy alerts.
+rules:
+  - name: frigate-internal
+    stream: "*"
+    user_agent: "(?i)(FFmpeg Frigate|frigate/ffmpeg)"
+    actor: "Frigate"
+    actor_type: service
+    suppressed: true
+
+  # Replace this documentation address with the snapshotter's actual address.
+  - name: safe-unlocked-snapshotter
+    stream: "*"
+    remote_cidr: "192.0.2.10/32"
+    actor: "safe unlocked snapshotter"
+    actor_type: service
+    suppressed: true
+
+  # Add a non-suppressed rule for the actual Home Assistant address when HA
+  # opens RTSP/HLS streams directly and its FFmpeg user-agent is not distinctive:
+  # - name: home-assistant
+  #   remote_cidr: "192.168.1.20/32"
+  #   actor: "Home Assistant"
+  #   actor_type: service
+  #   suppressed: false
+
+mqtt:
+  enabled: true
+  broker: "tcp://mosquitto:1883"
+  client_id: "camera-audit"
+  username: "${CAMERA_AUDIT_MQTT_USERNAME}"
+  password: "${CAMERA_AUDIT_MQTT_PASSWORD}"
+  topic_prefix: "camera_audit"
+  discovery_prefix: "homeassistant"
