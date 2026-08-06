@@ -9,7 +9,7 @@
 - WebRTC signaling correlated with go2rtc consumer sessions.
 - go2rtc's current consumer inventory from `/api/streams`; `/api/streams.dot`, the source for `/net.html`, is retained only as a credential-sanitized diagnostic graph.
 - Frigate and Home Assistant `latest.jpg` refreshes as renewable 75-second live-view leases. Repeated smart-streaming frames become one audit session rather than one row per image.
-- Birdseye as a composite view. An active Birdseye viewer conservatively activates every configured `birdseye_cameras` room.
+- Birdseye as a composite view. The gateway observes Frigate's proxied `/ws` `birdseye_layout` messages and activates only the room sensors for cameras currently present in the composite.
 
 Historical recordings, review thumbnails, event snapshots, and clips do not activate privacy alerts.
 
@@ -21,16 +21,33 @@ Frigate browser requests passing through Authentik have an exact username. WebRT
 
 1. Copy `config.example.yaml` to `config.yaml` and replace networks, camera names, and exclusion rules.
 2. Add the service from `compose.example.yaml` to the Docker network that contains Frigate.
-3. Change the Authentik proxy provider upstream from Frigate to `http://camera-audit:8080`.
-4. Ensure Authentik sends `X-authentik-username`, and set `trusted_proxies` to the actual outpost/proxy CIDR. Requests from other networks cannot use identity headers or access `/audit/`.
-5. Configure Frigate proxy authentication as before. The gateway preserves the Authentik headers while forwarding to port 8971.
-6. Point the Home Assistant Frigate integration at the audit gateway if its HTTP snapshot and WebRTC signaling accesses must be observed. Its RTSP sessions on port 8554 are still discovered through go2rtc.
-7. Keep Frigate ports 5000, 8971, and go2rtc port 1984 off the host network. Restrict RTSP 8554 to known service networks; expose WebRTC 8555 only where required.
-8. Import `home-assistant/privacy-alert-blueprint.yaml`, select each camera's discovered binary sensor, and configure the speaker/light/notification action for its room.
+   The audit container connects directly to the bundled go2rtc API at `http://frigate:1984`; no host port publication is needed when both containers share a Docker network.
+3. Protect the go2rtc API with HTTP Basic authentication. For bundled go2rtc, add this under Frigate's top-level `go2rtc` configuration, using secrets appropriate to your deployment:
+
+   ```yaml
+   go2rtc:
+     api:
+       username: camera-audit
+       password: a-long-random-secret
+   ```
+
+   Set the same values in `CAMERA_AUDIT_GO2RTC_USERNAME` and `CAMERA_AUDIT_GO2RTC_PASSWORD`. The daemon authenticates both `/api/streams` and `/api/streams.dot`; credentials are not stored in SQLite or emitted in logs. Leave go2rtc's `local_auth` at its default `false` for bundled Frigate: Frigate's own health check and nginx proxy call go2rtc over loopback without credentials, while a separate audit container is still authenticated because it is not a loopback client.
+4. Change the Authentik proxy provider upstream from Frigate to `http://camera-audit:8080`.
+5. Ensure Authentik sends `X-authentik-username`, and set `trusted_proxies` to the actual outpost/proxy CIDR. Requests from other networks cannot use identity headers or access `/audit/`.
+6. Configure Frigate proxy authentication as before. The gateway preserves the Authentik headers while forwarding to port 8971.
+7. Point the Home Assistant Frigate integration at the audit gateway if its HTTP snapshot and WebRTC signaling accesses must be observed. Its RTSP sessions on port 8554 are still discovered through go2rtc.
+8. Keep Frigate ports 5000, 8971, and go2rtc port 1984 off the host network. Port 1984 must be reachable from the audit container, but should not be published to an untrusted LAN because the go2rtc API is powerful. Restrict RTSP 8554 to known service networks; expose WebRTC 8555 only where required.
+9. Import `home-assistant/privacy-alert-blueprint.yaml`, select each camera's discovered binary sensor, and configure the speaker/light/notification action for its room.
 
 The dashboard is at `/audit/`. Any user authenticated by Authentik can see current consumers and history. Health endpoints are `/healthz` and `/readyz`.
 
 The daemon strips Authentik/forward-auth identity headers and forwarded client addresses from any request that does not originate in `trusted_proxies`. Authentik itself must also overwrite, rather than append to, identity headers received from browsers.
+
+### Birdseye layout
+
+Frigate's `/live/jsmpeg/birdseye` or go2rtc request identifies the viewer and the composite stream. Its separate `/ws` control channel publishes `birdseye_layout` JSON keyed by the physical cameras currently rendered. The gateway relays all WebSocket messages unchanged, inspects only server-to-client text messages with that exact topic, and does not persist or log unrelated payloads.
+
+`birdseye_cameras` is optional fallback data. It is used only while no active proxied control WebSocket has supplied a layout—for example with an older Frigate version or a direct RTSP Birdseye client that never opens Frigate's control socket. Leave it empty when all Birdseye viewing goes through the Frigate UI. The current layout and whether it came from `websocket`, `fallback`, or is `unavailable` are exposed by `/audit/api/v1/current`.
 
 ## Exclusions
 

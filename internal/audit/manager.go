@@ -61,6 +61,9 @@ type Manager struct {
 	signals              []signal
 	privacy              map[string]bool
 	zeroSince            map[string]time.Time
+	birdseyeLayout       map[string]struct{}
+	birdseyeControlConns map[uint64]bool
+	nextBirdseyeControl  uint64
 	lastPoll             time.Time
 	fresh                bool
 	dot                  string
@@ -70,10 +73,11 @@ type Manager struct {
 
 func New(cfg config.Config, s *store.Store, log *slog.Logger) (*Manager, error) {
 	m := &Manager{
-		cfg: cfg, store: s, client: go2rtc.New(cfg.Go2RTCURL), log: log,
+		cfg: cfg, store: s, client: go2rtc.New(cfg.Go2RTCURL, cfg.Go2RTCUsername, cfg.Go2RTCPassword), log: log,
 		sessions: make(map[string]*model.ActiveSession), activities: make(map[string]model.Activity),
 		liveHTTP: make(map[int64]liveHTTP), leases: make(map[string]snapshotLease),
 		privacy: make(map[string]bool), zeroSince: make(map[string]time.Time),
+		birdseyeControlConns: make(map[uint64]bool),
 	}
 	for _, r := range cfg.Rules {
 		cr := compiledRule{Rule: r}
@@ -91,6 +95,50 @@ func New(cfg config.Config, s *store.Store, log *slog.Logger) (*Manager, error) 
 
 func (m *Manager) SetObserver(fn PrivacyObserver)                  { m.observer = fn }
 func (m *Manager) SetAvailabilityObserver(fn AvailabilityObserver) { m.availabilityObserver = fn }
+
+// BirdseyeControlOpened marks a proxied Frigate control WebSocket as active.
+// A layout learned while at least one control socket is active takes priority
+// over the static fallback in birdseye_cameras.
+func (m *Manager) BirdseyeControlOpened() uint64 {
+	m.mu.Lock()
+	m.nextBirdseyeControl++
+	id := m.nextBirdseyeControl
+	if m.birdseyeControlConns == nil {
+		m.birdseyeControlConns = make(map[uint64]bool)
+	}
+	m.birdseyeControlConns[id] = false
+	m.mu.Unlock()
+	return id
+}
+
+func (m *Manager) BirdseyeControlClosed(id uint64) {
+	m.mu.Lock()
+	delete(m.birdseyeControlConns, id)
+	if !m.hasBirdseyeLayoutSocketLocked() {
+		m.birdseyeLayout = nil
+	}
+	m.mu.Unlock()
+}
+
+// UpdateBirdseyeLayout records the physical cameras Frigate currently renders
+// in its composite. The layout contains no image data or viewer identity.
+func (m *Manager) UpdateBirdseyeLayout(connectionID uint64, cameras []string) {
+	layout := make(map[string]struct{}, len(cameras))
+	for _, camera := range cameras {
+		camera = strings.TrimSpace(camera)
+		if camera != "" && camera != "birdseye" {
+			layout[camera] = struct{}{}
+		}
+	}
+	m.mu.Lock()
+	if _, connected := m.birdseyeControlConns[connectionID]; !connected {
+		m.mu.Unlock()
+		return
+	}
+	m.birdseyeControlConns[connectionID] = true
+	m.birdseyeLayout = layout
+	m.mu.Unlock()
+}
 
 func (m *Manager) Run(ctx context.Context) {
 	poll := time.NewTicker(m.cfg.PollInterval.Value())
@@ -418,7 +466,8 @@ func (m *Manager) tick(now time.Time) {
 		}
 	}
 	if raw["birdseye"] {
-		for _, camera := range m.cfg.BirdseyeCameras {
+		delete(raw, "birdseye")
+		for _, camera := range m.birdseyeTargetsLocked() {
 			raw[camera] = true
 		}
 	}
@@ -469,10 +518,41 @@ func (m *Manager) tick(now time.Time) {
 	}
 }
 
+func (m *Manager) birdseyeTargetsLocked() []string {
+	if m.hasBirdseyeLayoutSocketLocked() {
+		cameras := make([]string, 0, len(m.birdseyeLayout))
+		for camera := range m.birdseyeLayout {
+			cameras = append(cameras, camera)
+		}
+		sort.Strings(cameras)
+		return cameras
+	}
+	cameras := append([]string(nil), m.cfg.BirdseyeCameras...)
+	sort.Strings(cameras)
+	return cameras
+}
+
+func (m *Manager) hasBirdseyeLayoutSocketLocked() bool {
+	for _, suppliedLayout := range m.birdseyeControlConns {
+		if suppliedLayout {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) Current() model.Current {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	c := model.Current{Fresh: m.fresh, LastPoll: m.lastPoll, Privacy: make(map[string]bool), SanitizedGraph: m.dot}
+	c.BirdseyeLayout = m.birdseyeTargetsLocked()
+	if m.hasBirdseyeLayoutSocketLocked() {
+		c.BirdseyeLayoutSource = "websocket"
+	} else if len(m.cfg.BirdseyeCameras) > 0 {
+		c.BirdseyeLayoutSource = "fallback"
+	} else {
+		c.BirdseyeLayoutSource = "unavailable"
+	}
 	for _, s := range m.sessions {
 		c.Sessions = append(c.Sessions, *s)
 	}

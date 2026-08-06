@@ -49,6 +49,8 @@ type Config struct {
 	Listen            string   `yaml:"listen"`
 	FrigateURL        string   `yaml:"frigate_url"`
 	Go2RTCURL         string   `yaml:"go2rtc_url"`
+	Go2RTCUsername    string   `yaml:"go2rtc_username"`
+	Go2RTCPassword    string   `yaml:"go2rtc_password"`
 	Database          string   `yaml:"database"`
 	IdentityHeader    string   `yaml:"identity_header"`
 	TrustedProxies    []string `yaml:"trusted_proxies"`
@@ -87,6 +89,9 @@ func Load(path string) (Config, error) {
 	}
 	if c.FrigateURL == "" || c.Go2RTCURL == "" || c.Database == "" {
 		return Config{}, fmt.Errorf("frigate_url, go2rtc_url, and database are required")
+	}
+	if (c.Go2RTCUsername == "") != (c.Go2RTCPassword == "") {
+		return Config{}, fmt.Errorf("go2rtc_username and go2rtc_password must either both be set or both be empty")
 	}
 	if len(c.TrustedProxies) == 0 {
 		return Config{}, fmt.Errorf("trusted_proxies must contain the Authentik proxy network")

@@ -3,10 +3,12 @@ package audit
 import (
 	"io"
 	"log/slog"
+	"reflect"
 	"testing"
 	"time"
 
 	"xkem.am/camera-audit/internal/config"
+	"xkem.am/camera-audit/internal/model"
 )
 
 func TestHostOnly(t *testing.T) {
@@ -20,6 +22,62 @@ func TestHostOnly(t *testing.T) {
 		if got := hostOnly(input); got != want {
 			t.Errorf("hostOnly(%q)=%q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestBirdseyeUsesWebSocketLayoutBeforeFallback(t *testing.T) {
+	m := &Manager{
+		cfg:            config.Config{BirdseyeCameras: []string{"fallback"}},
+		sessions:       map[string]*model.ActiveSession{"birdseye/1": {Camera: "birdseye"}},
+		activities:     make(map[string]model.Activity),
+		liveHTTP:       make(map[int64]liveHTTP),
+		leases:         make(map[string]snapshotLease),
+		privacy:        make(map[string]bool),
+		zeroSince:      make(map[string]time.Time),
+		birdseyeLayout: make(map[string]struct{}),
+	}
+	controlID := m.BirdseyeControlOpened()
+	m.UpdateBirdseyeLayout(controlID, []string{"workshop", "hall", "workshop", "birdseye", ""})
+	m.tick(time.Now())
+
+	current := m.Current()
+	if !reflect.DeepEqual(current.BirdseyeLayout, []string{"hall", "workshop"}) {
+		t.Fatalf("unexpected Birdseye layout: %v", current.BirdseyeLayout)
+	}
+	if !current.Privacy["hall"] || !current.Privacy["workshop"] || current.Privacy["fallback"] || current.Privacy["birdseye"] {
+		t.Fatalf("unexpected privacy fan-out: %v", current.Privacy)
+	}
+}
+
+func TestBirdseyeFallsBackWithoutControlWebSocket(t *testing.T) {
+	m := &Manager{
+		cfg:        config.Config{BirdseyeCameras: []string{"fallback"}},
+		sessions:   map[string]*model.ActiveSession{"birdseye/1": {Camera: "birdseye"}},
+		activities: make(map[string]model.Activity),
+		liveHTTP:   make(map[int64]liveHTTP),
+		leases:     make(map[string]snapshotLease),
+		privacy:    make(map[string]bool),
+		zeroSince:  make(map[string]time.Time),
+	}
+	m.tick(time.Now())
+
+	current := m.Current()
+	if current.BirdseyeLayoutSource != "fallback" || !current.Privacy["fallback"] {
+		t.Fatalf("fallback was not used: %#v", current)
+	}
+}
+
+func TestBirdseyeLayoutExpiresWithSupplyingControlWebSocket(t *testing.T) {
+	m := &Manager{cfg: config.Config{BirdseyeCameras: []string{"fallback"}}}
+	supplyingID := m.BirdseyeControlOpened()
+	idleID := m.BirdseyeControlOpened()
+	defer m.BirdseyeControlClosed(idleID)
+	m.UpdateBirdseyeLayout(supplyingID, []string{"workshop"})
+	m.BirdseyeControlClosed(supplyingID)
+
+	current := m.Current()
+	if current.BirdseyeLayoutSource != "fallback" || !reflect.DeepEqual(current.BirdseyeLayout, []string{"fallback"}) {
+		t.Fatalf("stale WebSocket layout remained authoritative: %#v", current)
 	}
 }
 

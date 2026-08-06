@@ -61,10 +61,12 @@ type Activity struct {
 }
 
 type Current struct {
-	Fresh          bool            `json:"fresh"`
-	LastPoll       time.Time       `json:"last_poll"`
-	Sessions       []ActiveSession `json:"sessions"`
-	Activities     []Activity      `json:"frigate_users"`
-	Privacy        map[string]bool `json:"privacy"`
-	SanitizedGraph string          `json:"sanitized_graph,omitempty"`
+	Fresh                bool            `json:"fresh"`
+	LastPoll             time.Time       `json:"last_poll"`
+	Sessions             []ActiveSession `json:"sessions"`
+	Activities           []Activity      `json:"frigate_users"`
+	Privacy              map[string]bool `json:"privacy"`
+	BirdseyeLayout       []string        `json:"birdseye_layout"`
+	BirdseyeLayoutSource string          `json:"birdseye_layout_source"`
+	SanitizedGraph       string          `json:"sanitized_graph,omitempty"`
 }

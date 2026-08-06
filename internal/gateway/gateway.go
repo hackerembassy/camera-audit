@@ -27,6 +27,7 @@ type Gateway struct {
 	manager *audit.Manager
 	store   *store.Store
 	proxy   *httputil.ReverseProxy
+	target  *url.URL
 	trusted []netip.Prefix
 	log     *slog.Logger
 }
@@ -41,7 +42,7 @@ func New(cfg config.Config, manager *audit.Manager, store *store.Store, log *slo
 		log.Error("Frigate proxy", "error", err, "path", r.URL.Path)
 		http.Error(w, "Frigate upstream unavailable", http.StatusBadGateway)
 	}
-	g := &Gateway{cfg: cfg, manager: manager, store: store, proxy: p, log: log}
+	g := &Gateway{cfg: cfg, manager: manager, store: store, proxy: p, target: target, log: log}
 	for _, raw := range cfg.TrustedProxies {
 		prefix, _ := netip.ParsePrefix(raw)
 		g.trusted = append(g.trusted, prefix)
@@ -85,7 +86,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			g.manager.RecordSignal(camera, actor, actorType, "correlated", remote, ua, now)
 		}
 	}
-	g.proxy.ServeHTTP(w, r)
+	if isFrigateControlWebSocket(r) {
+		g.serveFrigateControlWebSocket(w, r)
+	} else {
+		g.proxy.ServeHTTP(w, r)
+	}
 	if eventID != 0 && kind != "snapshot_live" {
 		g.manager.EndHTTP(context.Background(), eventID, time.Now().UTC())
 	}
@@ -228,6 +233,7 @@ body{font:15px system-ui,sans-serif;max-width:1200px;margin:2rem auto;padding:0 
 table{border-collapse:collapse;width:100%;margin-bottom:2rem}th,td{text-align:left;padding:.45rem;border-bottom:1px solid #ddd}th{background:#f3f4f6}
 code{font-size:.85em}a{color:#1d4ed8}</style></head><body>
 <h1>Camera access audit</h1><p>go2rtc state: {{if .Current.Fresh}}<strong class="ok">fresh</strong>{{else}}<strong class="bad">stale</strong>{{end}} · last poll {{.Current.LastPoll}}</p>
+<p>Birdseye layout: <strong>{{.Current.BirdseyeLayoutSource}}</strong>{{range .Current.BirdseyeLayout}} · <span class="pill">{{.}}</span>{{end}}</p>
 <h2>Room privacy alerts</h2><table><tr><th>Camera</th><th>State</th></tr>{{range $camera,$active := .Current.Privacy}}<tr><td>{{$camera}}</td><td>{{if $active}}<strong class="bad">VIEWED</strong>{{else}}clear{{end}}</td></tr>{{else}}<tr><td colspan="2">No states yet</td></tr>{{end}}</table>
 <h2>Current go2rtc consumers</h2><table><tr><th>Camera</th><th>Actor</th><th>Confidence</th><th>Protocol</th><th>Remote</th><th>Expected</th></tr>
 {{range .Current.Sessions}}<tr><td>{{.Camera}}</td><td>{{.Actor}}</td><td>{{.Confidence}}</td><td>{{.Protocol}}</td><td><code>{{.RemoteAddr}}</code></td><td>{{.Suppressed}}</td></tr>{{else}}<tr><td colspan="6">None observed</td></tr>{{end}}</table>
