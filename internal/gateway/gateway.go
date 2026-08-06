@@ -26,18 +26,23 @@ import (
 )
 
 type Gateway struct {
-	cfg     config.Config
-	manager *audit.Manager
-	store   *store.Store
-	proxy   *httputil.ReverseProxy
-	target  *url.URL
-	tls     *tls.Config
-	trusted []netip.Prefix
-	log     *slog.Logger
+	cfg      config.Config
+	manager  *audit.Manager
+	store    *store.Store
+	proxy    *httputil.ReverseProxy
+	target   *url.URL
+	tls      *tls.Config
+	location *time.Location
+	trusted  []netip.Prefix
+	log      *slog.Logger
 }
 
 func New(cfg config.Config, manager *audit.Manager, store *store.Store, log *slog.Logger) (*Gateway, error) {
 	target, err := url.Parse(cfg.FrigateURL)
+	if err != nil {
+		return nil, err
+	}
+	location, err := cfg.Location()
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +63,7 @@ func New(cfg config.Config, manager *audit.Manager, store *store.Store, log *slo
 		log.Error("Frigate proxy", "error", err, "path", r.URL.Path)
 		http.Error(w, "Frigate upstream unavailable", http.StatusBadGateway)
 	}
-	g := &Gateway{cfg: cfg, manager: manager, store: store, proxy: p, target: target, tls: tlsConfig, log: log}
+	g := &Gateway{cfg: cfg, manager: manager, store: store, proxy: p, target: target, tls: tlsConfig, location: location, log: log}
 	for _, raw := range cfg.TrustedProxies {
 		prefix, _ := netip.ParsePrefix(raw)
 		g.trusted = append(g.trusted, prefix)
@@ -322,13 +327,67 @@ func (g *Gateway) exportCSV(w http.ResponseWriter, r *http.Request) {
 	for _, e := range events {
 		end := ""
 		if e.EndedAt != nil {
-			end = e.EndedAt.Format(time.RFC3339)
+			end = g.csvTime(*e.EndedAt)
 		}
 		_ = cw.Write([]string{strconv.FormatInt(e.ID, 10), e.Kind, e.Actor, e.Confidence, e.Camera, e.Protocol,
-			e.RemoteAddr, strconv.FormatBool(e.Suppressed), e.StartedAt.Format(time.RFC3339),
-			e.LastSeenAt.Format(time.RFC3339), end, e.Details})
+			e.RemoteAddr, strconv.FormatBool(e.Suppressed), g.csvTime(e.StartedAt),
+			g.csvTime(e.LastSeenAt), end, e.Details})
 	}
 	cw.Flush()
+}
+
+func (g *Gateway) csvTime(value time.Time) string {
+	return value.In(g.location).Format(time.RFC3339)
+}
+
+const dashboardTimeLayout = "2006-01-02 15:04:05 MST -07:00"
+
+func (g *Gateway) dashboardTime(value time.Time) string {
+	if value.IsZero() {
+		return "never"
+	}
+	return value.In(g.location).Format(dashboardTimeLayout)
+}
+
+type dashboardActivity struct {
+	Actor      string
+	RemoteAddr string
+	LastSeen   string
+}
+
+type dashboardEvent struct {
+	Kind       string
+	Camera     string
+	Actor      string
+	Protocol   string
+	Details    string
+	Suppressed bool
+	StartedAt  string
+	LastSeenAt string
+}
+
+func (g *Gateway) dashboardActivities(activities []model.Activity) []dashboardActivity {
+	out := make([]dashboardActivity, 0, len(activities))
+	for _, activity := range activities {
+		out = append(out, dashboardActivity{
+			Actor: activity.Actor, RemoteAddr: activity.RemoteAddr,
+			LastSeen: g.dashboardTime(activity.LastSeen),
+		})
+	}
+	return out
+}
+
+func (g *Gateway) dashboardEvents(events []model.Event) []dashboardEvent {
+	out := make([]dashboardEvent, 0, len(events))
+	for _, event := range events {
+		out = append(out, dashboardEvent{
+			Kind: event.Kind, Camera: event.Camera, Actor: event.Actor, Protocol: event.Protocol,
+			Details: event.Details, Suppressed: event.Suppressed,
+			StartedAt:  g.dashboardTime(event.StartedAt),
+			LastSeenAt: g.dashboardTime(event.LastSeenAt),
+		})
+	}
+	return out
 }
 
 var dashboardTemplate = template.Must(template.New("dashboard").Parse(`<!doctype html>
@@ -338,12 +397,13 @@ body{font:15px system-ui,sans-serif;max-width:1200px;margin:2rem auto;padding:0 
 .ok{color:#047857}.bad{color:#b91c1c}.pill{display:inline-block;padding:.15rem .5rem;border-radius:1rem;background:#e5e7eb}
 table{border-collapse:collapse;width:100%;margin-bottom:2rem}th,td{text-align:left;padding:.45rem;border-bottom:1px solid #ddd}th{background:#f3f4f6}
 code{font-size:.85em}a{color:#1d4ed8}</style></head><body>
-<h1>Camera access audit</h1><p>go2rtc state: {{if .Current.Fresh}}<strong class="ok">fresh</strong>{{else}}<strong class="bad">stale</strong>{{end}} · last poll {{.Current.LastPoll}}</p>
+<h1>Camera access audit</h1><p>go2rtc state: {{if .Current.Fresh}}<strong class="ok">fresh</strong>{{else}}<strong class="bad">stale</strong>{{end}} · last poll {{.LastPoll}}</p>
+<p>Displayed timezone: <strong>{{.Timezone}}</strong>. JSON API timestamps remain UTC.</p>
 <p>Birdseye layout: <strong>{{.Current.BirdseyeLayoutSource}}</strong>{{range .Current.BirdseyeLayout}} · <span class="pill">{{.}}</span>{{end}}</p>
 <h2>Room privacy alerts</h2><table><tr><th>Camera</th><th>State</th></tr>{{range $camera,$active := .Current.Privacy}}<tr><td>{{$camera}}</td><td>{{if $active}}<strong class="bad">VIEWED</strong>{{else}}clear{{end}}</td></tr>{{else}}<tr><td colspan="2">No states yet</td></tr>{{end}}</table>
 <h2>Current go2rtc consumers</h2><table><tr><th>Camera</th><th>Actor</th><th>Confidence</th><th>Protocol</th><th>Remote</th><th>Expected</th></tr>
 {{range .Current.Sessions}}<tr><td>{{.Camera}}</td><td>{{.Actor}}</td><td>{{.Confidence}}</td><td>{{.Protocol}}</td><td><code>{{.RemoteAddr}}</code></td><td>{{.Suppressed}}</td></tr>{{else}}<tr><td colspan="6">None observed</td></tr>{{end}}</table>
-<h2>Active Frigate users</h2><table><tr><th>User</th><th>Remote</th><th>Last activity</th></tr>{{range .Current.Activities}}<tr><td>{{.Actor}}</td><td><code>{{.RemoteAddr}}</code></td><td>{{.LastSeen}}</td></tr>{{else}}<tr><td colspan="3">None</td></tr>{{end}}</table>
+<h2>Active Frigate users</h2><table><tr><th>User</th><th>Remote</th><th>Last activity</th></tr>{{range .Activities}}<tr><td>{{.Actor}}</td><td><code>{{.RemoteAddr}}</code></td><td>{{.LastSeen}}</td></tr>{{else}}<tr><td colspan="3">None</td></tr>{{end}}</table>
 <h2>Recent Frigate and viewer activity</h2><p><a href="/audit/export.csv">Export all CSV</a> · <a href="/audit/api/v1/history">All history JSON</a> · <a href="/audit/api/v1/current">Current JSON</a> · <a href="/audit/api/v1/graph">Sanitized go2rtc DOT</a></p>
 <table><tr><th>Last seen</th><th>Started</th><th>Kind</th><th>Camera</th><th>Actor</th><th>Details</th><th>Expected</th></tr>{{range .Events}}<tr><td>{{.LastSeenAt}}</td><td>{{.StartedAt}}</td><td>{{.Kind}}</td><td>{{.Camera}}</td><td>{{.Actor}}</td><td><code>{{.Details}}</code></td><td>{{.Suppressed}}</td></tr>{{else}}<tr><td colspan="7">None observed</td></tr>{{end}}</table>
 <h2>Recent go2rtc session history</h2>
@@ -363,11 +423,20 @@ func (g *Gateway) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	current := g.manager.Current()
 	if err := dashboardTemplate.Execute(w, struct {
 		Current      model.Current
-		Events       []model.Event
-		StreamEvents []model.Event
-	}{g.manager.Current(), events, streamEvents}); err != nil {
+		Timezone     string
+		LastPoll     string
+		Activities   []dashboardActivity
+		Events       []dashboardEvent
+		StreamEvents []dashboardEvent
+	}{
+		Current: current, Timezone: g.location.String(),
+		LastPoll:   g.dashboardTime(current.LastPoll),
+		Activities: g.dashboardActivities(current.Activities),
+		Events:     g.dashboardEvents(events), StreamEvents: g.dashboardEvents(streamEvents),
+	}); err != nil {
 		g.log.Error("render dashboard", "error", err)
 	}
 }

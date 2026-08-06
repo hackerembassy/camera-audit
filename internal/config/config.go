@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
 	"gopkg.in/yaml.v3"
 )
@@ -56,6 +57,7 @@ type Config struct {
 	Go2RTCUsername               string   `yaml:"go2rtc_username"`
 	Go2RTCPassword               string   `yaml:"go2rtc_password"`
 	Database                     string   `yaml:"database"`
+	Timezone                     string   `yaml:"timezone"`
 	IdentityHeader               string   `yaml:"identity_header"`
 	TrustedProxies               []string `yaml:"trusted_proxies"`
 	PollInterval                 Duration `yaml:"poll_interval"`
@@ -76,6 +78,7 @@ func Load(path string) (Config, error) {
 	b = []byte(os.ExpandEnv(string(b)))
 	c := Config{
 		Listen:            ":8080",
+		Timezone:          "UTC",
 		IdentityHeader:    "X-authentik-username",
 		PollInterval:      Duration(2 * time.Second),
 		ActivityWindow:    Duration(5 * time.Minute),
@@ -103,6 +106,9 @@ func Load(path string) (Config, error) {
 	if len(c.TrustedProxies) == 0 {
 		return Config{}, fmt.Errorf("trusted_proxies must contain the Authentik proxy network")
 	}
+	if _, err := c.Location(); err != nil {
+		return Config{}, err
+	}
 	for _, raw := range c.TrustedProxies {
 		if _, err := netip.ParsePrefix(raw); err != nil {
 			return Config{}, fmt.Errorf("trusted proxy %q: %w", raw, err)
@@ -125,4 +131,16 @@ func Load(path string) (Config, error) {
 	}
 	c.IdentityHeader = strings.TrimSpace(c.IdentityHeader)
 	return c, nil
+}
+
+func (c Config) Location() (*time.Location, error) {
+	name := strings.TrimSpace(c.Timezone)
+	if name == "" {
+		name = "UTC"
+	}
+	location, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("timezone %q: %w", name, err)
+	}
+	return location, nil
 }

@@ -30,9 +30,11 @@ func New(cfg config.MQTT, log *slog.Logger) (*Publisher, error) {
 	}
 	opts := mqtt.NewClientOptions().AddBroker(cfg.Broker).SetClientID(cfg.ClientID).
 		SetUsername(cfg.Username).SetPassword(cfg.Password).SetAutoReconnect(true).
-		SetConnectRetry(true).SetConnectRetryInterval(5 * time.Second)
+		SetConnectRetry(true).SetConnectRetryInterval(5 * time.Second).
+		SetOrderMatters(false)
 	opts.SetWill(cfg.TopicPrefix+"/availability", "offline", 1, true)
 	opts.OnConnect = func(c mqtt.Client) {
+		p.subscribeRetainedStateCleanup(c)
 		p.mu.Lock()
 		available := p.available
 		states := make(map[string]bool, len(p.states))
@@ -86,9 +88,56 @@ func (p *Publisher) SetAvailable(available bool) {
 
 func (p *Publisher) Close() {
 	if p.client != nil {
+		p.mu.Lock()
+		cameras := make([]string, 0, len(p.states))
+		for camera := range p.states {
+			cameras = append(cameras, camera)
+			p.states[camera] = false
+		}
+		p.available = false
+		p.mu.Unlock()
+		if p.client.IsConnected() {
+			for _, camera := range cameras {
+				p.publish(p.client, p.stateTopic(camera), state(false), true)
+			}
+		}
 		p.publish(p.client, p.cfg.TopicPrefix+"/availability", "offline", true)
 		p.client.Disconnect(250)
 	}
+}
+
+func (p *Publisher) subscribeRetainedStateCleanup(c mqtt.Client) {
+	filter := p.cfg.TopicPrefix + "/+/viewer"
+	token := c.Subscribe(filter, 1, func(client mqtt.Client, message mqtt.Message) {
+		if !p.shouldClearRetained(message.Topic(), string(message.Payload()), message.Retained()) {
+			return
+		}
+		p.log.Info("clear stale retained MQTT viewer state", "topic", message.Topic())
+		p.publish(client, message.Topic(), state(false), true)
+	})
+	if !token.WaitTimeout(5 * time.Second) {
+		p.log.Warn("subscribe MQTT retained-state cleanup timed out", "topic", filter)
+		return
+	}
+	if token.Error() != nil {
+		p.log.Warn("subscribe MQTT retained-state cleanup", "topic", filter, "error", token.Error())
+	}
+}
+
+func (p *Publisher) shouldClearRetained(topic, payload string, retained bool) bool {
+	if !retained || strings.TrimSpace(payload) != state(true) {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for camera, active := range p.states {
+		if p.stateTopic(camera) == topic {
+			if active {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 var nonSlug = regexp.MustCompile(`[^a-z0-9]+`)

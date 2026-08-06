@@ -25,6 +25,9 @@ go2rtc_url: "http://frigate:1984"
 go2rtc_username: "${CAMERA_AUDIT_GO2RTC_USERNAME}"
 go2rtc_password: "${CAMERA_AUDIT_GO2RTC_PASSWORD}"
 database: "/data/audit.db"
+# IANA timezone used by the human dashboard and CSV export. SQLite and JSON
+# API timestamps remain UTC. Examples: UTC, Asia/Yerevan, Europe/Berlin.
+timezone: "UTC"
 
 identity_header: "X-authentik-username"
 trusted_proxies:
@@ -96,3 +99,5 @@ mqtt:
   password: "${CAMERA_AUDIT_MQTT_PASSWORD}"
   topic_prefix: "camera_audit"
   discovery_prefix: "homeassistant"
+  # The MQTT account must be allowed to subscribe to
+  # camera_audit/+/viewer so stale retained ON states can be cleared.

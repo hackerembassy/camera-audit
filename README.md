@@ -41,7 +41,7 @@ Frigate browser requests passing through Authentik have an exact username. WebRT
 9. Keep Frigate ports 5000, 8971, and go2rtc port 1984 off the host network. Port 1984 must be reachable from the audit container, but should not be published to an untrusted LAN because the go2rtc API is powerful. Restrict RTSP 8554 to known service networks; expose WebRTC 8555 only where required.
 10. Import `home-assistant/privacy-alert-blueprint.yaml`, select each camera's discovered binary sensor, and configure the speaker/light/notification action for its room.
 
-The dashboard is at `/audit/`. Any user authenticated by Authentik can see current consumers and history. Frigate/viewer activity and raw go2rtc session history use separate tables so reconnect churn cannot crowd authenticated activity out of view. Both tables and the history API are ordered by `last_seen_at`; the CSV export contains all event kinds. Health endpoints are `/healthz` and `/readyz`.
+The dashboard is at `/audit/`. Any user authenticated by Authentik can see current consumers and history. Frigate/viewer activity and raw go2rtc session history use separate tables so reconnect churn cannot crowd authenticated activity out of view. Both tables and the history API are ordered by `last_seen_at`; the CSV export contains all event kinds. Set `timezone` to an IANA name such as `Asia/Yerevan` to render dashboard and CSV timestamps in local time with an explicit UTC offset. SQLite storage and JSON APIs remain UTC. The timezone database is embedded in the binary, so this also works in the distroless container. Health endpoints are `/healthz` and `/readyz`.
 
 The daemon strips Authentik/forward-auth identity headers and forwarded client addresses from any request that does not originate in `trusted_proxies`. Authentik itself must also overwrite, rather than append to, identity headers received from browsers.
 
@@ -60,6 +60,8 @@ Home Assistant is not excluded by default: viewing through HA should warn the ro
 ## MQTT behavior
 
 For each observed camera, MQTT Discovery creates an occupancy-class binary sensor named `<camera> external viewer active`. Only `ON`, `OFF`, and availability are published—never usernames, IP addresses, or counts. State turns on immediately and clears after 30 uninterrupted seconds without an unsuppressed viewer. The blueprint triggers only on a real `off` to `on` transition.
+
+Viewer states are retained so Home Assistant recovers promptly after its own restart. On every daemon MQTT connection, `camera-audit` subscribes to `<topic_prefix>/+/viewer`, clears retained `ON` values that are not active in the current process, and then republishes current state. A graceful shutdown also publishes `OFF` for every known camera before marking the device offline. The MQTT account therefore needs subscribe permission for `<topic_prefix>/+/viewer` in addition to its existing publish permissions. A genuinely active viewer may briefly transition through `OFF` during a full daemon restart and is restored to `ON` by the first go2rtc poll.
 
 ## Local development
 

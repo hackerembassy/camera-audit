@@ -49,6 +49,24 @@ func TestCameraAccess(t *testing.T) {
 	}
 }
 
+func TestConfiguredTimezoneFormatsHumanAndCSVTimes(t *testing.T) {
+	location, err := time.LoadLocation("Asia/Yerevan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := &Gateway{location: location}
+	value := time.Date(2026, 8, 6, 7, 30, 0, 0, time.UTC)
+	if got, want := gateway.csvTime(value), "2026-08-06T11:30:00+04:00"; got != want {
+		t.Fatalf("csvTime=%q, want %q", got, want)
+	}
+	if got, want := gateway.dashboardTime(value), "2026-08-06 11:30:00 +04 +04:00"; got != want {
+		t.Fatalf("dashboardTime=%q, want %q", got, want)
+	}
+	if got := gateway.dashboardTime(time.Time{}); got != "never" {
+		t.Fatalf("zero dashboard time=%q", got)
+	}
+}
+
 func TestStripProxyIdentity(t *testing.T) {
 	h := http.Header{
 		"X-Authentik-Username": []string{"mallory"},
