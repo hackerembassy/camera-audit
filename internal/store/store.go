@@ -136,6 +136,16 @@ func (s *Store) TouchEvent(ctx context.Context, id int64, at time.Time) error {
 	return err
 }
 
+// UpdateEventIdentity upgrades an open event after signaling arrives later than
+// the first go2rtc inventory that exposed its media consumer.
+func (s *Store) UpdateEventIdentity(ctx context.Context, id int64, actor, actorType, confidence string) error {
+	if id == 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE events SET actor=?,actor_type=?,confidence=? WHERE id=? AND ended_at IS NULL`, actor, actorType, confidence, id)
+	return err
+}
+
 // TouchEvents checkpoints multiple active events in one SQLite transaction.
 // The caller supplies each event's actual observation time, which may differ
 // when a consumer has missed one inventory but has not yet been closed.

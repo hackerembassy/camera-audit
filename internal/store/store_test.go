@@ -30,6 +30,37 @@ func TestEventLifecycleAndRecovery(t *testing.T) {
 	}
 }
 
+func TestUpdateOpenEventIdentity(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	id, err := s.Start(ctx, model.Event{Kind: "stream", Actor: "Unknown", ActorType: "unknown", Confidence: "service/device", StartedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateEventIdentity(ctx, id, "alice", "person", "correlated"); err != nil {
+		t.Fatal(err)
+	}
+	events, err := s.RecentStreams(ctx, 10, "")
+	if err != nil || len(events) != 1 || events[0].Actor != "alice" || events[0].ActorType != "person" || events[0].Confidence != "correlated" {
+		t.Fatalf("updated stream identity=%#v err=%v", events, err)
+	}
+	if err := s.End(ctx, id, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateEventIdentity(ctx, id, "bob", "person", "correlated"); err != nil {
+		t.Fatal(err)
+	}
+	events, err = s.RecentStreams(ctx, 10, "")
+	if err != nil || events[0].Actor != "alice" {
+		t.Fatalf("closed event identity changed: %#v err=%v", events, err)
+	}
+}
+
 func TestRecentUsesLastSeenAndSeparatesStreamHistory(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "audit.db"))
 	if err != nil {

@@ -101,6 +101,28 @@ func TestBirdseyeLayoutReturnsToLatestRemainingControlWebSocket(t *testing.T) {
 	}
 }
 
+func TestCurrentSessionsUseDeterministicFirstObservedOrder(t *testing.T) {
+	firstSeen := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
+	m := &Manager{sessions: map[string]*model.ActiveSession{
+		"workshop/20": {Key: "workshop/20", Camera: "workshop", ConnectionID: 20, StartedAt: firstSeen},
+		"hall/30":     {Key: "hall/30", Camera: "hall", ConnectionID: 30, StartedAt: firstSeen.Add(-time.Second)},
+		"hall/20":     {Key: "hall/20", Camera: "hall", ConnectionID: 20, StartedAt: firstSeen},
+		"hall/10":     {Key: "hall/10", Camera: "hall", ConnectionID: 10, StartedAt: firstSeen},
+	}}
+
+	want := []string{"hall/30", "hall/10", "hall/20", "workshop/20"}
+	for attempt := 0; attempt < 20; attempt++ {
+		current := m.Current()
+		got := make([]string, 0, len(current.Sessions))
+		for _, session := range current.Sessions {
+			got = append(got, session.Key)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("session order=%v, want %v", got, want)
+		}
+	}
+}
+
 func TestHomeAssistantSignalMayHaveDifferentWebRTCPeerAddress(t *testing.T) {
 	now := time.Now()
 	m := &Manager{signals: []signal{{camera: "workshop", actor: "Home Assistant", actorType: "service", confidence: "correlated", remote: "10.0.0.2", userAgent: "HomeAssistant", at: now}}}
@@ -115,6 +137,52 @@ func TestPersonSignalDoesNotMatchAddressSubstring(t *testing.T) {
 	m := &Manager{signals: []signal{{camera: "workshop", actor: "alice", actorType: "person", confidence: "correlated", remote: "10.0.0.1", at: now}}}
 	if got, ok := m.matchSignal("workshop", "udp4 host 110.0.0.10:50000", "", now.Add(time.Second)); ok {
 		t.Fatalf("unrelated address was correlated: %#v", got)
+	}
+}
+
+func TestPersonSignalMayCrossHomeAssistantProxyWithSameBrowser(t *testing.T) {
+	now := time.Now()
+	const safari = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/27.0 Safari/605.1.15"
+	m := &Manager{signals: []signal{{camera: "doorbell_sub", actor: "alice", actorType: "person", confidence: "correlated", remote: "37.186.119.0", userAgent: safari, at: now}}}
+	got, ok := m.matchSignal("doorbell_sub", "10.13.37.3:49152", safari, now.Add(8*time.Second))
+	if !ok || got.actor != "alice" || got.actorType != "person" {
+		t.Fatalf("proxied browser signal was not correlated: %#v %v", got, ok)
+	}
+}
+
+func TestPersonSignalDoesNotCrossProxyWhenBrowserIdentityIsAmbiguous(t *testing.T) {
+	now := time.Now()
+	const safari = "Mozilla/5.0 AppleWebKit/605.1.15 Version/27.0 Safari/605.1.15"
+	m := &Manager{signals: []signal{
+		{camera: "doorbell_sub", actor: "alice", actorType: "person", remote: "192.0.2.1", userAgent: safari, at: now},
+		{camera: "doorbell_sub", actor: "bob", actorType: "person", remote: "192.0.2.2", userAgent: safari, at: now},
+	}}
+	if got, ok := m.matchSignal("doorbell_sub", "10.13.37.3:49152", safari, now.Add(time.Second)); ok {
+		t.Fatalf("ambiguous browser signal was correlated: %#v", got)
+	}
+}
+
+func TestClassifyInfersInteractiveBrowserAsPerson(t *testing.T) {
+	m := &Manager{}
+	actor, actorType, confidence, _, _ := m.classify("doorbell_sub", "ws", "10.13.37.3:49152", "Mozilla/5.0 AppleWebKit/605.1.15 Version/27.0 Safari/605.1.15")
+	if actor != "Browser viewer (10.13.37.3)" || actorType != "person" || confidence != "inferred" {
+		t.Fatalf("browser classification=%q %q %q", actor, actorType, confidence)
+	}
+}
+
+func TestIdentityConfidenceOnlyUpgrades(t *testing.T) {
+	for _, tt := range []struct {
+		current, candidate string
+		want               bool
+	}{
+		{current: "service/device", candidate: "inferred", want: true},
+		{current: "inferred", candidate: "correlated", want: true},
+		{current: "correlated", candidate: "inferred"},
+		{current: "exact", candidate: "correlated"},
+	} {
+		if got := shouldUpgradeIdentity(tt.current, tt.candidate); got != tt.want {
+			t.Errorf("shouldUpgradeIdentity(%q,%q)=%v, want %v", tt.current, tt.candidate, got, tt.want)
+		}
 	}
 }
 
@@ -205,9 +273,38 @@ func TestConcurrentIdenticalRequestsCreateOneLease(t *testing.T) {
 func TestRecordSignalPrunesExpiredHints(t *testing.T) {
 	now := time.Now().UTC()
 	m := &Manager{signals: []signal{{camera: "old", at: now.Add(-time.Minute)}}}
-	m.RecordSignal("current", "alice", "person", "correlated", "192.0.2.1", "browser", now)
+	m.RecordSignal(context.Background(), "current", "alice", "person", "correlated", "192.0.2.1", "browser", now)
 	if len(m.signals) != 1 || m.signals[0].camera != "current" {
 		t.Fatalf("expired signals were retained: %#v", m.signals)
+	}
+}
+
+func TestRecordSignalImmediatelyUpgradesActiveGenericSession(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const safari = "Mozilla/5.0 AppleWebKit/605.1.15 Version/27.0 Safari/605.1.15"
+	eventID, err := s.Start(ctx, model.Event{Kind: "stream", Actor: "Browser viewer (10.13.37.3)", ActorType: "person", Confidence: "inferred", Camera: "doorbell_sub", RemoteAddr: "10.13.37.3", UserAgent: safari, StartedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &model.ActiveSession{EventID: eventID, Camera: "doorbell_sub", Actor: "Browser viewer (10.13.37.3)", ActorType: "person", Confidence: "inferred", RemoteAddr: "10.13.37.3", UserAgent: safari}
+	m := &Manager{
+		store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		sessions: map[string]*model.ActiveSession{"doorbell_sub/42": session},
+	}
+
+	m.RecordSignal(ctx, "doorbell_sub", "alice", "person", "correlated", "37.186.119.0", safari, now)
+	if session.Actor != "alice" || session.ActorType != "person" || session.Confidence != "correlated" {
+		t.Fatalf("active session identity was not upgraded: %#v", session)
+	}
+	events, err := s.RecentStreams(ctx, 10, "")
+	if err != nil || len(events) != 1 || events[0].Actor != "alice" || events[0].Confidence != "correlated" {
+		t.Fatalf("persisted session identity was not upgraded: %#v err=%v", events, err)
 	}
 }
 

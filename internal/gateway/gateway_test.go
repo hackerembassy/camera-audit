@@ -154,7 +154,7 @@ func TestDashboardSeparatesRecordingsAndAutoUpdates(t *testing.T) {
 	if err := dashboardTemplate.Execute(&page, nil); err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{"/audit/api/v1/dashboard", "setInterval", "Recording playback history", "User agent"} {
+	for _, marker := range []string{"/audit/api/v1/dashboard", "setInterval", "Recording playback history", "User agent", "First observed", "vis.parseDOTNetwork", "vis-network@10.0.2"} {
 		if !strings.Contains(page.String(), marker) {
 			t.Errorf("dashboard is missing %q", marker)
 		}
@@ -166,9 +166,14 @@ func TestDashboardOverlaysActiveStreamLastSeenFromMemory(t *testing.T) {
 	live := persisted.Add(4*time.Minute + 59*time.Second)
 	events := []model.Event{{ID: 42, Kind: "stream", LastSeenAt: persisted}}
 	sessions := []model.ActiveSession{{EventID: 42, LastSeenAt: live}}
-	overlayActiveStreamLastSeen(events, sessions)
+	active := overlayActiveStreamLastSeen(events, sessions)
 	if !events[0].LastSeenAt.Equal(live) {
 		t.Fatalf("dashboard history last seen=%v, want live value %v", events[0].LastSeenAt, live)
+	}
+	gateway := &Gateway{location: time.UTC}
+	rows := gateway.dashboardStreamEvents(events, active)
+	if len(rows) != 1 || !rows[0].Live {
+		t.Fatalf("active dashboard history row was not marked live: %#v", rows)
 	}
 }
 

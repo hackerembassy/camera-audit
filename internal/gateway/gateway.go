@@ -124,6 +124,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if actor == "" {
 		if strings.Contains(strings.ToLower(ua), "homeassistant") {
 			actor, actorType, confidence = "Home Assistant", "service", "service/device"
+		} else if browserActor, ok := audit.InferredBrowserActor(remote, ua); ok {
+			actor, actorType, confidence = browserActor, "person", "inferred"
 		} else {
 			actor, actorType, confidence = "Unauthenticated service ("+remote+")", "unknown", "service/device"
 		}
@@ -136,7 +138,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if kind != "" {
 		eventID = g.manager.StartHTTP(r.Context(), kind, camera, details, actor, actorType, confidence, protocol, remote, ua, now)
 		if kind == "webrtc_signal" || kind == "mse" || (kind == "birdseye_live" && protocol == "ws") {
-			g.manager.RecordSignal(camera, actor, actorType, "correlated", remote, ua, now)
+			g.manager.RecordSignal(r.Context(), camera, actor, actorType, "correlated", remote, ua, now)
 		}
 	}
 	if isFrigateControlWebSocket(r) {
@@ -398,6 +400,7 @@ type dashboardEvent struct {
 	Details    string `json:"details"`
 	UserAgent  string `json:"user_agent,omitempty"`
 	Expected   bool   `json:"expected"`
+	Live       bool   `json:"live,omitempty"`
 	StartedAt  string `json:"started_at"`
 	LastSeenAt string `json:"last_seen_at"`
 }
@@ -458,6 +461,14 @@ func (g *Gateway) dashboardEvents(events []model.Event) []dashboardEvent {
 	return out
 }
 
+func (g *Gateway) dashboardStreamEvents(events []model.Event, activeEventIDs map[int64]bool) []dashboardEvent {
+	out := g.dashboardEvents(events)
+	for i, event := range events {
+		out[i].Live = activeEventIDs[event.ID]
+	}
+	return out
+}
+
 func dashboardUserAgent(actorType string, expected bool, userAgent string) string {
 	if actorType == "unknown" || !expected {
 		return userAgent
@@ -493,7 +504,7 @@ func (g *Gateway) dashboardData(ctx context.Context) (dashboardSnapshot, error) 
 	if err != nil {
 		return dashboardSnapshot{}, err
 	}
-	overlayActiveStreamLastSeen(streamEvents, current.Sessions)
+	activeStreamEvents := overlayActiveStreamLastSeen(streamEvents, current.Sessions)
 	sort.SliceStable(streamEvents, func(i, j int) bool {
 		if streamEvents[i].LastSeenAt.Equal(streamEvents[j].LastSeenAt) {
 			return streamEvents[i].ID > streamEvents[j].ID
@@ -510,20 +521,25 @@ func (g *Gateway) dashboardData(ctx context.Context) (dashboardSnapshot, error) 
 		BirdseyeLayout: current.BirdseyeLayout, BirdseyeLayoutSource: current.BirdseyeLayoutSource,
 		Privacy: privacy, Sessions: g.dashboardSessions(current.Sessions),
 		Activities: g.dashboardActivities(current.Activities), Events: g.dashboardEvents(events),
-		Recordings: g.dashboardEvents(recordings), StreamEvents: g.dashboardEvents(streamEvents),
+		Recordings: g.dashboardEvents(recordings), StreamEvents: g.dashboardStreamEvents(streamEvents, activeStreamEvents),
 	}, nil
 }
 
-func overlayActiveStreamLastSeen(events []model.Event, sessions []model.ActiveSession) {
+func overlayActiveStreamLastSeen(events []model.Event, sessions []model.ActiveSession) map[int64]bool {
 	activeLastSeen := make(map[int64]time.Time, len(sessions))
 	for _, session := range sessions {
-		activeLastSeen[session.EventID] = session.LastSeenAt
+		if session.EventID != 0 {
+			activeLastSeen[session.EventID] = session.LastSeenAt
+		}
 	}
+	activeEventIDs := make(map[int64]bool, len(activeLastSeen))
 	for i := range events {
 		if lastSeen, active := activeLastSeen[events[i].ID]; active {
 			events[i].LastSeenAt = lastSeen
+			activeEventIDs[events[i].ID] = true
 		}
 	}
+	return activeEventIDs
 }
 
 var dashboardTemplate = template.Must(template.New("dashboard").Parse(`<!doctype html>
@@ -532,22 +548,26 @@ var dashboardTemplate = template.Must(template.New("dashboard").Parse(`<!doctype
 body{font:15px system-ui,sans-serif;max-width:1400px;margin:2rem auto;padding:0 1rem;color:#1f2937}h1,h2{color:#111827}
 .meta{color:#4b5563}.ok{color:#047857}.bad{color:#b91c1c}.pill{display:inline-block;padding:.15rem .5rem;border-radius:1rem;background:#e5e7eb;margin-left:.25rem}
 .table-wrap{overflow-x:auto;margin-bottom:2rem}table{border-collapse:collapse;width:100%;min-width:680px}th,td{text-align:left;padding:.45rem;border-bottom:1px solid #ddd;vertical-align:top}th{background:#f3f4f6;white-space:nowrap}
-code{font-size:.85em}.ua{max-width:34rem;overflow-wrap:anywhere}.muted{color:#6b7280}a{color:#1d4ed8}</style></head><body>
+code{font-size:.85em}.ua{max-width:34rem;overflow-wrap:anywhere}.muted{color:#6b7280}a{color:#1d4ed8}
+.graph-wrap{height:32rem;border:1px solid #d1d5db;border-radius:.5rem;background:#f9fafb;margin-bottom:2rem}
+</style><script src="https://cdn.jsdelivr.net/npm/vis-network@10.0.2/standalone/umd/vis-network.min.js"></script></head><body>
 <h1>Camera access audit</h1>
 <p class="meta" aria-live="polite">go2rtc state: <strong id="fresh-state" class="muted">loading</strong> · last poll <span id="last-poll">loading</span> · <span id="update-state">updating</span></p>
 <p>Displayed timezone: <strong id="timezone">loading</strong>. JSON API timestamps remain UTC.</p>
 <p>Birdseye layout: <strong id="birdseye-source">loading</strong><span id="birdseye-layout"></span></p>
 <h2>Room privacy alerts</h2><div class="table-wrap"><table><thead><tr><th>Camera</th><th>State</th></tr></thead><tbody id="privacy-rows"></tbody></table></div>
-<h2>Current go2rtc consumers</h2><div class="table-wrap"><table><thead><tr><th>Last seen</th><th>Started</th><th>Camera</th><th>Actor</th><th>Confidence</th><th>Protocol</th><th>Remote</th><th>User agent</th><th>Expected</th></tr></thead><tbody id="session-rows"></tbody></table></div>
+<h2>Current go2rtc consumers</h2><p class="meta">Oldest first by daemon first observation; go2rtc does not expose connection-since time.</p><div class="table-wrap"><table><thead><tr><th>Last seen</th><th>First observed</th><th>Camera</th><th>Actor</th><th>Confidence</th><th>Protocol</th><th>Remote</th><th>User agent</th><th>Expected</th></tr></thead><tbody id="session-rows"></tbody></table></div>
+<h2>go2rtc connection graph</h2><p class="meta"><span id="graph-state">loading sanitized graph</span> · <a href="/audit/api/v1/graph">raw DOT</a></p><div id="go2rtc-graph" class="graph-wrap" aria-live="polite"></div>
 <h2>Active Frigate users</h2><div class="table-wrap"><table><thead><tr><th>User</th><th>Remote</th><th>Last activity</th></tr></thead><tbody id="activity-rows"></tbody></table></div>
-<h2>Recent Frigate and viewer activity</h2><p><a href="/audit/export.csv">Export all CSV</a> · <a href="/audit/api/v1/history">All history JSON</a> · <a href="/audit/api/v1/current">Current JSON</a> · <a href="/audit/api/v1/graph">Sanitized go2rtc DOT</a></p>
+<h2>Recent Frigate and viewer activity</h2><p><a href="/audit/export.csv">Export all CSV</a> · <a href="/audit/api/v1/history">All history JSON</a> · <a href="/audit/api/v1/current">Current JSON</a></p>
 <div class="table-wrap"><table><thead><tr><th>Last seen</th><th>Started</th><th>Kind</th><th>Camera</th><th>Actor</th><th>Details</th><th>Expected</th></tr></thead><tbody id="event-rows"></tbody></table></div>
 <h2>Recording playback history</h2><div class="table-wrap"><table><thead><tr><th>Last seen</th><th>Started</th><th>Camera</th><th>Actor</th><th>Protocol</th><th>Details</th></tr></thead><tbody id="recording-rows"></tbody></table></div>
-<h2>Recent go2rtc session history</h2><div class="table-wrap"><table><thead><tr><th>Last seen</th><th>Started</th><th>Camera</th><th>Actor</th><th>Protocol</th><th>User agent</th><th>Expected</th></tr></thead><tbody id="stream-rows"></tbody></table></div>
+<h2>Recent go2rtc session history</h2><div class="table-wrap"><table><thead><tr><th>State / last seen</th><th>Started</th><th>Camera</th><th>Actor</th><th>Protocol</th><th>User agent</th><th>Expected</th></tr></thead><tbody id="stream-rows"></tbody></table></div>
 <script>
 (function () {
   "use strict";
-  var loading = false;
+  /* global vis */
+  var loading = false, graphLoading = false, lastGraph = null, graphNetwork;
   function byID(id) { return document.getElementById(id); }
   function addCell(row, value, className, code) {
     var cell = document.createElement("td");
@@ -572,6 +592,23 @@ code{font-size:.85em}.ua{max-width:34rem;overflow-wrap:anywhere}.muted{color:#6b
     }
     items.forEach(function (item) { var row = document.createElement("tr"); render(row, item); body.appendChild(row); });
   }
+  function renderGraph(dot) {
+    var data = vis.parseDOTNetwork(dot);
+    var options = {edges: {font: {align: "middle"}, smooth: false}, nodes: {shape: "box"}, physics: false};
+    if (!graphNetwork) {
+      graphNetwork = new vis.Network(byID("go2rtc-graph"), data, options);
+      graphNetwork.storePositions();
+    } else {
+      var positions = graphNetwork.getPositions(), viewPosition = graphNetwork.getViewPosition(), scale = graphNetwork.getScale(), selectedNodes = graphNetwork.getSelectedNodes();
+      graphNetwork.setData(data);
+      Object.keys(positions).forEach(function (nodeID) {
+        graphNetwork.moveNode(nodeID, positions[nodeID].x, positions[nodeID].y);
+      });
+      graphNetwork.moveTo({position: viewPosition, scale: scale});
+      graphNetwork.selectNodes(selectedNodes);
+    }
+    byID("graph-state").textContent = data.nodes.length + " nodes, " + data.edges.length + " connections"; byID("graph-state").className = "ok";
+  }
   function render(data) {
     var fresh = byID("fresh-state"); fresh.textContent = data.fresh ? "fresh" : "stale"; fresh.className = data.fresh ? "ok" : "bad";
     byID("last-poll").textContent = data.last_poll; byID("timezone").textContent = data.timezone;
@@ -591,7 +628,7 @@ code{font-size:.85em}.ua{max-width:34rem;overflow-wrap:anywhere}.muted{color:#6b
       addCell(row, item.last_seen_at); addCell(row, item.started_at); addCell(row, item.camera); addCell(row, item.actor); addCell(row, item.protocol); addCell(row, item.details, "", true);
     });
     renderRows("stream-rows", data.stream_events, 7, function (row, item) {
-      addCell(row, item.last_seen_at); addCell(row, item.started_at); addCell(row, item.camera); addCell(row, item.actor); addCell(row, item.protocol); addCell(row, item.user_agent, "ua", true); addExpected(row, item.expected);
+      addCell(row, item.live ? "live" : item.last_seen_at, item.live ? "ok" : ""); addCell(row, item.started_at); addCell(row, item.camera); addCell(row, item.actor); addCell(row, item.protocol); addCell(row, item.user_agent, "ua", true); addExpected(row, item.expected);
     });
     byID("update-state").textContent = "updated automatically"; byID("update-state").className = "";
   }
@@ -605,9 +642,20 @@ code{font-size:.85em}.ua{max-width:34rem;overflow-wrap:anywhere}.muted{color:#6b
       byID("update-state").textContent = "update failed; retrying"; byID("update-state").className = "bad";
     } finally { loading = false; }
   }
-  refresh();
-  setInterval(function () { if (!document.hidden) { refresh(); } }, 5000);
-  document.addEventListener("visibilitychange", function () { if (!document.hidden) { refresh(); } });
+  async function refreshGraph() {
+    if (graphLoading) { return; } graphLoading = true;
+    try {
+      var response = await fetch("/audit/api/v1/graph", {cache: "no-store"});
+      if (!response.ok) { throw new Error("HTTP " + response.status); }
+      var dot = await response.text();
+      if (dot !== lastGraph) { renderGraph(dot); lastGraph = dot; }
+    } catch (error) { byID("graph-state").textContent = "graph update failed; retrying"; byID("graph-state").className = "bad"; }
+    finally { graphLoading = false; }
+  }
+  function refreshVisible() { if (!document.hidden) { refresh(); refreshGraph(); } }
+  refresh(); refreshGraph();
+  setInterval(refreshVisible, 5000);
+  document.addEventListener("visibilitychange", refreshVisible);
 }());
 </script></body></html>`))
 

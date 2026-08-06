@@ -85,7 +85,10 @@ Every `poll_interval`, the manager reads go2rtc's consumer inventory and keys a
 session by `camera/connection-id`. A key whose protocol, address, or user agent
 changes is treated as a reused connection ID: the old event is closed and a new
 one is opened. A missing consumer needs two successful polls before closure so
-a single incomplete snapshot does not create reconnect churn.
+a single incomplete snapshot does not create reconnect churn. go2rtc does not
+publish a connection-start time, so the first successful observation is the
+local `started_at`; current sessions sort by it with deterministic camera,
+connection-ID, and key tie-breakers.
 
 Every successful inventory updates the active session's exact in-memory
 `last_seen_at`. Open sessions are checkpointed to SQLite together in one
@@ -93,7 +96,8 @@ transaction every five minutes. A disconnect, reused connection ID, outage
 boundary, or graceful shutdown writes the final observed time immediately;
 `ended_at` records when disappearance was detected and may therefore be later.
 The dashboard overlays active history rows with the in-memory value between
-checkpoints.
+checkpoints and labels those history rows `live` instead of presenting a moving
+last-seen timestamp.
 
 A failed poll marks current state stale but does not immediately end sessions.
 On the first successful poll after an outage, all pre-outage sessions are closed
@@ -102,6 +106,9 @@ this freshness flag; `/healthz` only reports that the process is serving.
 
 The diagnostic DOT graph is refreshed by an independent loop. A missing or slow
 graph endpoint therefore cannot delay consumer reconciliation or privacy state.
+The dashboard renders the sanitized DOT using the same vis-network parser and
+position-preserving update strategy as go2rtc's `net.html`; raw DOT remains
+available for diagnostics.
 
 ### Identity and suppression
 
@@ -114,7 +121,13 @@ An exact person identity observed during MSE, WebRTC, or Birdseye signaling may
 replace the generic identity of a matching go2rtc consumer. This is explicitly
 marked `correlated`, not `exact`, because signaling and media are separate
 connections. Service signals are allowed broader matching because backend
-integrations commonly change connection details.
+integrations commonly change connection details. For a person crossing a Home
+Assistant or container proxy, a different address is accepted only when the
+camera and full browser user agent identify one unambiguous recent person. A
+browser with no authenticated identity is typed as an inferred person while its
+actor remains the generic `Browser viewer`; backend Home Assistant traffic
+remains a service. Correlation is retried for active generic sessions so a poll
+that races ahead of signaling can upgrade both memory and the open SQLite row.
 
 ### Privacy state
 
@@ -196,7 +209,7 @@ to defaults.
 | `/audit/api/v1/current` | trusted proxy plus identity | Current sessions, activity, privacy, Birdseye, and freshness. |
 | `/audit/api/v1/dashboard` | trusted proxy plus identity | Combined live state and separated dashboard histories. |
 | `/audit/api/v1/history` | trusted proxy plus identity | Recent events; accepts `limit`, `camera`, and `type=frigate\|recordings\|streams`. |
-| `/audit/api/v1/graph` | trusted proxy plus identity | Credential-sanitized go2rtc DOT graph. |
+| `/audit/api/v1/graph` | trusted proxy plus identity | Credential-sanitized go2rtc DOT source used by the dashboard graph. |
 | `/audit/export.csv` | trusted proxy plus identity | Up to 1,000 recent events, optionally filtered by `camera`. |
 | all other routes | forwarded to Frigate | Proxied and audited when recognized. |
 

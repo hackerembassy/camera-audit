@@ -257,6 +257,9 @@ func (m *Manager) poll(ctx context.Context) {
 				if existing.Protocol == c.Protocol && existing.RemoteAddr == hostOnly(c.RemoteAddr) && existing.UserAgent == c.UserAgent {
 					existing.Misses = 0
 					existing.LastSeenAt = now
+					if sig, ok := m.matchSignal(camera, c.RemoteAddr, c.UserAgent, now); ok {
+						m.upgradeSessionIdentityLocked(ctx, existing, sig)
+					}
 					continue
 				}
 				if err := m.store.EndStream(ctx, existing.EventID, now, existing.LastSeenAt); err != nil {
@@ -304,6 +307,35 @@ func (m *Manager) poll(ctx context.Context) {
 	if !wasFresh && availabilityObserver != nil {
 		availabilityObserver(true)
 	}
+}
+
+func shouldUpgradeIdentity(current, candidate string) bool {
+	rank := func(confidence string) int {
+		switch confidence {
+		case "exact":
+			return 3
+		case "correlated":
+			return 2
+		case "inferred":
+			return 1
+		default:
+			return 0
+		}
+	}
+	return rank(candidate) > rank(current)
+}
+
+func (m *Manager) upgradeSessionIdentityLocked(ctx context.Context, session *model.ActiveSession, candidate signal) {
+	if !shouldUpgradeIdentity(session.Confidence, candidate.confidence) {
+		return
+	}
+	if m.store != nil {
+		if err := m.store.UpdateEventIdentity(ctx, session.EventID, candidate.actor, candidate.actorType, candidate.confidence); err != nil {
+			m.log.Error("upgrade active stream identity", "error", err)
+			return
+		}
+	}
+	session.Actor, session.ActorType, session.Confidence = candidate.actor, candidate.actorType, candidate.confidence
 }
 
 func (m *Manager) checkpointStreamsLocked(ctx context.Context, now time.Time) {
@@ -381,6 +413,9 @@ func (m *Manager) classify(camera, protocol, remote, ua string) (string, string,
 	if strings.Contains(strings.ToLower(ua), "homeassistant") {
 		return "Home Assistant", "service", "service/device", false, ""
 	}
+	if actor, ok := InferredBrowserActor(remote, ua); ok {
+		return actor, "person", "inferred", false, ""
+	}
 	if host == "" {
 		host = "unknown"
 	}
@@ -391,21 +426,58 @@ func (m *Manager) matchSignal(camera, remote, ua string, now time.Time) (signal,
 	// Search newest-first because repeated signaling for one camera is common.
 	// This is a correlation hint, not proof, hence the caller's confidence value.
 	host := hostOnly(remote)
+	var userAgentCandidate signal
+	candidateIdentity := ""
+	ambiguousUserAgent := false
 	for i := len(m.signals) - 1; i >= 0; i-- {
 		s := m.signals[i]
 		if s.camera != camera || now.Sub(s.at) > 15*time.Second {
 			continue
 		}
 		signalHost := hostOnly(s.remote)
-		if s.actorType != "service" && signalHost != "" && host != "" && host != signalHost {
-			continue
+		if s.actorType == "service" {
+			return s, true
 		}
-		if s.actorType != "service" && s.userAgent != "" && ua != "" && s.userAgent != ua {
-			continue
+		sameHost := signalHost == "" || host == "" || host == signalHost
+		sameUserAgent := s.userAgent != "" && ua != "" && s.userAgent == ua
+		compatibleUserAgent := s.userAgent == "" || ua == "" || sameUserAgent
+		if sameHost && compatibleUserAgent {
+			return s, true
 		}
-		return s, true
+		// Home Assistant and reverse proxies can make signaling and media appear
+		// on different network addresses. A unique, exact browser user-agent for
+		// the same camera is still a useful correlation hint. Do not guess when
+		// two different people produced indistinguishable recent signals.
+		if sameUserAgent {
+			identity := s.actor + "\x00" + s.actorType
+			if candidateIdentity == "" {
+				candidateIdentity = identity
+				userAgentCandidate = s
+			} else if candidateIdentity != identity {
+				ambiguousUserAgent = true
+			}
+		}
+	}
+	if candidateIdentity != "" && !ambiguousUserAgent {
+		return userAgentCandidate, true
 	}
 	return signal{}, false
+}
+
+// InferredBrowserActor distinguishes interactive browser viewers from backend
+// services when no authenticated username reaches the gateway. It intentionally
+// does not claim which person is using the browser.
+func InferredBrowserActor(remote, ua string) (string, bool) {
+	lower := strings.ToLower(ua)
+	if !strings.Contains(lower, "mozilla/") ||
+		(!strings.Contains(lower, "applewebkit/") && !strings.Contains(lower, "firefox/") && !strings.Contains(lower, "gecko/")) {
+		return "", false
+	}
+	host := hostOnly(remote)
+	if host == "" {
+		host = "unknown"
+	}
+	return "Browser viewer (" + host + ")", true
 }
 
 func hostOnly(remote string) string {
@@ -450,11 +522,19 @@ func (m *Manager) RecordActivity(ctx context.Context, actor, remote, ua string, 
 	}
 }
 
-func (m *Manager) RecordSignal(camera, actor, actorType, confidence, remote, ua string, now time.Time) {
+func (m *Manager) RecordSignal(ctx context.Context, camera, actor, actorType, confidence, remote, ua string, now time.Time) {
 	m.mu.Lock()
 	m.pruneSignalsLocked(now)
 	m.signals = append(m.signals, signal{camera: camera, actor: actor, actorType: actorType,
 		confidence: confidence, remote: remote, userAgent: ua, at: now.UTC()})
+	for _, session := range m.sessions {
+		if session.Camera != camera {
+			continue
+		}
+		if candidate, ok := m.matchSignal(camera, session.RemoteAddr, session.UserAgent, now); ok {
+			m.upgradeSessionIdentityLocked(ctx, session, candidate)
+		}
+	}
 	m.mu.Unlock()
 }
 
@@ -700,7 +780,23 @@ func (m *Manager) Current() model.Current {
 	for k, v := range m.privacy {
 		c.Privacy[k] = v
 	}
-	sort.Slice(c.Sessions, func(i, j int) bool { return c.Sessions[i].StartedAt.Before(c.Sessions[j].StartedAt) })
+	// go2rtc does not expose a connection-start timestamp, so StartedAt is the
+	// first successful poll that observed the consumer. The remaining fields
+	// make the order total and prevent map iteration order from shuffling rows
+	// whose sessions were first observed in the same poll.
+	sort.Slice(c.Sessions, func(i, j int) bool {
+		left, right := c.Sessions[i], c.Sessions[j]
+		if !left.StartedAt.Equal(right.StartedAt) {
+			return left.StartedAt.Before(right.StartedAt)
+		}
+		if left.Camera != right.Camera {
+			return left.Camera < right.Camera
+		}
+		if left.ConnectionID != right.ConnectionID {
+			return left.ConnectionID < right.ConnectionID
+		}
+		return left.Key < right.Key
+	})
 	sort.Slice(c.Activities, func(i, j int) bool { return c.Activities[i].LastSeen.After(c.Activities[j].LastSeen) })
 	return c
 }
