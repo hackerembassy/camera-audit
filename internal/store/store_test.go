@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,5 +27,83 @@ func TestEventLifecycleAndRecovery(t *testing.T) {
 	events, err := s.Recent(context.Background(), 10, "")
 	if err != nil || len(events) != 1 || events[0].EndedAt == nil {
 		t.Fatalf("events=%#v err=%v", events, err)
+	}
+}
+
+func TestRecentUsesLastSeenAndSeparatesStreamHistory(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	start := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
+	streamID, err := s.Start(ctx, model.Event{Kind: "stream", Actor: "camera", ActorType: "service", Confidence: "service/device", StartedAt: start.Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activityID, err := s.Start(ctx, model.Event{Kind: "frigate_activity", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: start})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.End(ctx, streamID, start.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	lastSeen := start.Add(3 * time.Minute)
+	if err := s.TouchEvent(ctx, activityID, lastSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TouchEvent(ctx, activityID, start.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Recent(ctx, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].ID != activityID || !events[0].LastSeenAt.Equal(lastSeen) {
+		t.Fatalf("unexpected recent events: %#v", events)
+	}
+	frigate, err := s.RecentFrigate(ctx, 10, "")
+	if err != nil || len(frigate) != 1 || frigate[0].Kind != "frigate_activity" {
+		t.Fatalf("Frigate history=%#v err=%v", frigate, err)
+	}
+	streams, err := s.RecentStreams(ctx, 10, "")
+	if err != nil || len(streams) != 1 || streams[0].Kind != "stream" {
+		t.Fatalf("stream history=%#v err=%v", streams, err)
+	}
+}
+
+func TestMigratesExistingEventsWithLastSeen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE events (
+id INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,actor TEXT NOT NULL,actor_type TEXT NOT NULL,
+confidence TEXT NOT NULL,camera TEXT NOT NULL DEFAULT '',protocol TEXT NOT NULL DEFAULT '',remote_addr TEXT NOT NULL DEFAULT '',
+user_agent TEXT NOT NULL DEFAULT '',suppressed INTEGER NOT NULL DEFAULT 0,suppression_rule TEXT NOT NULL DEFAULT '',
+started_at TEXT NOT NULL,ended_at TEXT,details TEXT NOT NULL DEFAULT '');
+INSERT INTO events(kind,actor,actor_type,confidence,started_at,ended_at) VALUES('frigate_activity','alice','person','exact','2026-08-06T07:00:00Z','2026-08-06T07:05:00Z');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	events, err := s.Recent(context.Background(), 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 8, 6, 7, 5, 0, 0, time.UTC)
+	if len(events) != 1 || !events[0].LastSeenAt.Equal(want) {
+		t.Fatalf("migrated events=%#v", events)
 	}
 }

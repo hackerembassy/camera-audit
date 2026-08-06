@@ -123,11 +123,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.manager.RecordActivity(r.Context(), actor, remote, ua, now)
 	}
 
-	kind, camera, protocol := cameraAccess(r)
+	kind, camera, protocol, details := cameraAccess(r)
 	var eventID int64
 	if kind != "" {
-		eventID = g.manager.StartHTTP(r.Context(), kind, camera, actor, actorType, confidence, protocol, remote, ua, now)
-		if kind == "webrtc_signal" || kind == "mse" {
+		eventID = g.manager.StartHTTP(r.Context(), kind, camera, details, actor, actorType, confidence, protocol, remote, ua, now)
+		if kind == "webrtc_signal" || kind == "mse" || (kind == "birdseye_live" && protocol == "ws") {
 			g.manager.RecordSignal(camera, actor, actorType, "correlated", remote, ua, now)
 		}
 	}
@@ -136,7 +136,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		g.proxy.ServeHTTP(w, r)
 	}
-	if eventID != 0 && kind != "snapshot_live" {
+	if eventID != 0 {
 		g.manager.EndHTTP(context.Background(), eventID, time.Now().UTC())
 	}
 }
@@ -154,24 +154,84 @@ func stripProxyIdentity(h http.Header, configured string) {
 	}
 }
 
-func cameraAccess(r *http.Request) (kind, camera, protocol string) {
+func cameraAccess(r *http.Request) (kind, camera, protocol, details string) {
 	p := r.URL.Path
+	if camera, protocol, details, ok := recordingPlayback(p); ok {
+		return "recording_playback", camera, protocol, details
+	}
 	if strings.HasPrefix(p, "/live/jsmpeg/") {
-		return "jsmpeg", strings.TrimPrefix(p, "/live/jsmpeg/"), "ws"
+		camera = strings.TrimPrefix(p, "/live/jsmpeg/")
+		if camera == "birdseye" {
+			return "birdseye_live", camera, "ws", ""
+		}
+		return "jsmpeg", camera, "ws", ""
 	}
 	if p == "/live/mse/api/ws" || p == "/api/go2rtc/api/ws" {
-		return "mse", r.URL.Query().Get("src"), "ws"
+		camera = r.URL.Query().Get("src")
+		if camera == "birdseye" {
+			return "birdseye_live", camera, "ws", ""
+		}
+		return "mse", camera, "ws", ""
 	}
 	if p == "/api/go2rtc/webrtc" {
-		return "webrtc_signal", r.URL.Query().Get("src"), "webrtc"
+		return "webrtc_signal", r.URL.Query().Get("src"), "webrtc", ""
 	}
 	if strings.HasPrefix(p, "/api/") && strings.HasSuffix(p, "/latest.jpg") {
 		camera = strings.TrimSuffix(strings.TrimPrefix(p, "/api/"), "/latest.jpg")
 		if camera != "" && !strings.Contains(camera, "/") {
-			return "snapshot_live", camera, "http"
+			if camera == "birdseye" {
+				return "birdseye_live", camera, "http", ""
+			}
+			return "snapshot_live", camera, "http", ""
 		}
 	}
-	return "", "", ""
+	return "", "", "", ""
+}
+
+func recordingPlayback(requestPath string) (camera, protocol, details string, ok bool) {
+	parts := strings.Split(strings.Trim(requestPath, "/"), "/")
+	if len(parts) == 0 {
+		return "", "", "", false
+	}
+	if parts[0] == "api" {
+		parts = parts[1:]
+	}
+	if len(parts) == 0 {
+		return "", "", "", false
+	}
+
+	if parts[0] == "vod" {
+		protocol = "hls"
+		parts = parts[1:]
+		if len(parts) >= 2 && parts[0] == "event" {
+			return "", protocol, "event=" + parts[1], true
+		}
+		if len(parts) >= 6 && parts[0] == "clip" && parts[2] == "start" && parts[4] == "end" {
+			return parts[1], protocol, "start=" + parts[3] + " end=" + parts[5], true
+		}
+		if len(parts) >= 5 && parts[1] == "start" && parts[3] == "end" {
+			return parts[0], protocol, "start=" + parts[2] + " end=" + parts[4], true
+		}
+		if len(parts) >= 4 && strings.Contains(parts[0], "-") {
+			return parts[3], protocol, "hour=" + strings.Join(parts[:3], "/"), true
+		}
+		return "", "", "", false
+	}
+
+	protocol = "http"
+	if len(parts) >= 6 && parts[1] == "start" && parts[3] == "end" && parts[5] == "clip.mp4" {
+		return parts[0], protocol, "start=" + parts[2] + " end=" + parts[4], true
+	}
+	if len(parts) >= 3 && parts[0] == "events" && parts[2] == "clip.mp4" {
+		return "", protocol, "event=" + parts[1], true
+	}
+	if len(parts) >= 3 && parts[0] == "review" && parts[2] == "clip.mp4" {
+		return "", protocol, "review=" + parts[1], true
+	}
+	if len(parts) == 3 && parts[2] == "clip.mp4" && parts[0] != "events" && parts[0] != "review" {
+		return parts[0], protocol, "label=" + parts[1], true
+	}
+	return "", "", "", false
 }
 
 func (g *Gateway) identity(r *http.Request) (string, bool) {
@@ -258,14 +318,15 @@ func (g *Gateway) exportCSV(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", `attachment; filename="camera-audit.csv"`)
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"id", "kind", "actor", "confidence", "camera", "protocol", "remote_addr", "suppressed", "started_at", "ended_at"})
+	_ = cw.Write([]string{"id", "kind", "actor", "confidence", "camera", "protocol", "remote_addr", "suppressed", "started_at", "last_seen_at", "ended_at", "details"})
 	for _, e := range events {
 		end := ""
 		if e.EndedAt != nil {
 			end = e.EndedAt.Format(time.RFC3339)
 		}
 		_ = cw.Write([]string{strconv.FormatInt(e.ID, 10), e.Kind, e.Actor, e.Confidence, e.Camera, e.Protocol,
-			e.RemoteAddr, strconv.FormatBool(e.Suppressed), e.StartedAt.Format(time.RFC3339), end})
+			e.RemoteAddr, strconv.FormatBool(e.Suppressed), e.StartedAt.Format(time.RFC3339),
+			e.LastSeenAt.Format(time.RFC3339), end, e.Details})
 	}
 	cw.Flush()
 }
@@ -283,12 +344,19 @@ code{font-size:.85em}a{color:#1d4ed8}</style></head><body>
 <h2>Current go2rtc consumers</h2><table><tr><th>Camera</th><th>Actor</th><th>Confidence</th><th>Protocol</th><th>Remote</th><th>Expected</th></tr>
 {{range .Current.Sessions}}<tr><td>{{.Camera}}</td><td>{{.Actor}}</td><td>{{.Confidence}}</td><td>{{.Protocol}}</td><td><code>{{.RemoteAddr}}</code></td><td>{{.Suppressed}}</td></tr>{{else}}<tr><td colspan="6">None observed</td></tr>{{end}}</table>
 <h2>Active Frigate users</h2><table><tr><th>User</th><th>Remote</th><th>Last activity</th></tr>{{range .Current.Activities}}<tr><td>{{.Actor}}</td><td><code>{{.RemoteAddr}}</code></td><td>{{.LastSeen}}</td></tr>{{else}}<tr><td colspan="3">None</td></tr>{{end}}</table>
-<h2>Recent history</h2><p><a href="/audit/export.csv">Export CSV</a> · <a href="/audit/api/v1/current">Current JSON</a> · <a href="/audit/api/v1/graph">Sanitized go2rtc DOT</a></p>
-<table><tr><th>Started</th><th>Kind</th><th>Camera</th><th>Actor</th><th>Confidence</th><th>Expected</th></tr>{{range .Events}}<tr><td>{{.StartedAt}}</td><td>{{.Kind}}</td><td>{{.Camera}}</td><td>{{.Actor}}</td><td>{{.Confidence}}</td><td>{{.Suppressed}}</td></tr>{{end}}</table>
+<h2>Recent Frigate and viewer activity</h2><p><a href="/audit/export.csv">Export all CSV</a> · <a href="/audit/api/v1/history">All history JSON</a> · <a href="/audit/api/v1/current">Current JSON</a> · <a href="/audit/api/v1/graph">Sanitized go2rtc DOT</a></p>
+<table><tr><th>Last seen</th><th>Started</th><th>Kind</th><th>Camera</th><th>Actor</th><th>Details</th><th>Expected</th></tr>{{range .Events}}<tr><td>{{.LastSeenAt}}</td><td>{{.StartedAt}}</td><td>{{.Kind}}</td><td>{{.Camera}}</td><td>{{.Actor}}</td><td><code>{{.Details}}</code></td><td>{{.Suppressed}}</td></tr>{{else}}<tr><td colspan="7">None observed</td></tr>{{end}}</table>
+<h2>Recent go2rtc session history</h2>
+<table><tr><th>Last seen</th><th>Started</th><th>Camera</th><th>Actor</th><th>Protocol</th><th>Expected</th></tr>{{range .StreamEvents}}<tr><td>{{.LastSeenAt}}</td><td>{{.StartedAt}}</td><td>{{.Camera}}</td><td>{{.Actor}}</td><td>{{.Protocol}}</td><td>{{.Suppressed}}</td></tr>{{else}}<tr><td colspan="6">None observed</td></tr>{{end}}</table>
 </body></html>`))
 
 func (g *Gateway) dashboard(w http.ResponseWriter, r *http.Request) {
-	events, err := g.store.Recent(r.Context(), 100, "")
+	events, err := g.store.RecentFrigate(r.Context(), 100, "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	streamEvents, err := g.store.RecentStreams(r.Context(), 100, "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -296,9 +364,10 @@ func (g *Gateway) dashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	if err := dashboardTemplate.Execute(w, struct {
-		Current model.Current
-		Events  []model.Event
-	}{g.manager.Current(), events}); err != nil {
+		Current      model.Current
+		Events       []model.Event
+		StreamEvents []model.Event
+	}{g.manager.Current(), events, streamEvents}); err != nil {
 		g.log.Error("render dashboard", "error", err)
 	}
 }

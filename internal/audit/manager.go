@@ -35,10 +35,11 @@ type liveHTTP struct {
 	suppressed bool
 }
 
-type snapshotLease struct {
+type activityLease struct {
 	eventID    int64
 	camera     string
 	suppressed bool
+	privacy    bool
 	expires    time.Time
 }
 
@@ -57,7 +58,7 @@ type Manager struct {
 	sessions             map[string]*model.ActiveSession
 	activities           map[string]model.Activity
 	liveHTTP             map[int64]liveHTTP
-	leases               map[string]snapshotLease
+	leases               map[string]activityLease
 	signals              []signal
 	privacy              map[string]bool
 	zeroSince            map[string]time.Time
@@ -75,7 +76,7 @@ func New(cfg config.Config, s *store.Store, log *slog.Logger) (*Manager, error) 
 	m := &Manager{
 		cfg: cfg, store: s, client: go2rtc.New(cfg.Go2RTCURL, cfg.Go2RTCUsername, cfg.Go2RTCPassword), log: log,
 		sessions: make(map[string]*model.ActiveSession), activities: make(map[string]model.Activity),
-		liveHTTP: make(map[int64]liveHTTP), leases: make(map[string]snapshotLease),
+		liveHTTP: make(map[int64]liveHTTP), leases: make(map[string]activityLease),
 		privacy: make(map[string]bool), zeroSince: make(map[string]time.Time),
 		birdseyeControlConns: make(map[uint64]bool),
 	}
@@ -364,6 +365,9 @@ func (m *Manager) RecordActivity(ctx context.Context, actor, remote, ua string, 
 	}
 	m.activities[key] = a
 	m.mu.Unlock()
+	if err := m.store.TouchEvent(ctx, a.EventID, a.LastSeen); err != nil {
+		m.log.Error("persist Frigate activity last seen", "error", err)
+	}
 	if err := m.store.TouchActivity(ctx, a); err != nil {
 		m.log.Error("persist Frigate activity", "error", err)
 	}
@@ -376,34 +380,39 @@ func (m *Manager) RecordSignal(camera, actor, actorType, confidence, remote, ua 
 	m.mu.Unlock()
 }
 
-func (m *Manager) StartHTTP(ctx context.Context, kind, camera, actor, actorType, confidence, protocol, remote, ua string, now time.Time) int64 {
+func (m *Manager) StartHTTP(ctx context.Context, kind, camera, details, actor, actorType, confidence, protocol, remote, ua string, now time.Time) int64 {
 	classifiedActor, classifiedType, _, suppressed, rule := m.classify(camera, protocol, remote, ua)
 	if rule != "" && actorType != "person" {
 		actor, actorType = classifiedActor, classifiedType
 	}
-	if kind == "snapshot_live" {
-		key := camera + "\x00" + actor + "\x00" + remote
+	leaseDuration, leasePrivacy := m.httpLease(kind, protocol)
+	leaseKey := kind + "\x00" + camera + "\x00" + details + "\x00" + actor + "\x00" + remote + "\x00" + ua
+	if leaseDuration > 0 {
 		m.mu.Lock()
-		if lease, ok := m.leases[key]; ok {
-			lease.expires = now.Add(m.cfg.SnapshotLease.Value())
-			m.leases[key] = lease
+		if lease, ok := m.leases[leaseKey]; ok {
+			lease.expires = now.Add(leaseDuration)
+			m.leases[leaseKey] = lease
 			m.mu.Unlock()
+			if err := m.store.TouchEvent(ctx, lease.eventID, now); err != nil {
+				m.log.Error("persist leased Frigate access last seen", "error", err)
+			}
 			return 0
 		}
 		m.mu.Unlock()
 	}
 	e := model.Event{Kind: kind, Actor: actor, ActorType: actorType, Confidence: confidence, Camera: camera,
-		Protocol: protocol, RemoteAddr: remote, UserAgent: ua, Suppressed: suppressed, SuppressionRule: rule, StartedAt: now.UTC()}
+		Protocol: protocol, RemoteAddr: remote, UserAgent: ua, Suppressed: suppressed, SuppressionRule: rule,
+		StartedAt: now.UTC(), Details: details}
 	id, err := m.store.Start(ctx, e)
 	if err != nil {
 		m.log.Error("persist HTTP camera access", "error", err)
 		return 0
 	}
-	if kind == "snapshot_live" {
+	if leaseDuration > 0 {
 		m.mu.Lock()
-		key := camera + "\x00" + actor + "\x00" + remote
-		m.leases[key] = snapshotLease{eventID: id, camera: camera, suppressed: suppressed, expires: now.Add(m.cfg.SnapshotLease.Value())}
+		m.leases[leaseKey] = activityLease{eventID: id, camera: camera, suppressed: suppressed, privacy: leasePrivacy, expires: now.Add(leaseDuration)}
 		m.mu.Unlock()
+		return 0
 	} else if kind == "webrtc_signal" {
 		if err := m.store.End(ctx, id, now.UTC()); err != nil {
 			m.log.Error("persist WebRTC signal end", "error", err)
@@ -415,6 +424,22 @@ func (m *Manager) StartHTTP(ctx context.Context, kind, camera, actor, actorType,
 		m.mu.Unlock()
 	}
 	return id
+}
+
+func (m *Manager) httpLease(kind, protocol string) (time.Duration, bool) {
+	switch kind {
+	case "snapshot_live":
+		return m.cfg.SnapshotLease.Value(), true
+	case "birdseye_live":
+		if protocol == "http" {
+			return m.cfg.SnapshotLease.Value(), true
+		}
+		return 0, false
+	case "recording_playback":
+		return m.cfg.ActivityWindow.Value(), false
+	default:
+		return 0, false
+	}
 }
 
 func (m *Manager) EndHTTP(ctx context.Context, id int64, now time.Time) {
@@ -444,7 +469,7 @@ func (m *Manager) tick(now time.Time) {
 	for key, lease := range m.leases {
 		if now.After(lease.expires) {
 			if err := m.store.End(context.Background(), lease.eventID, lease.expires); err != nil {
-				m.log.Error("persist snapshot-live end", "error", err)
+				m.log.Error("persist leased Frigate access end", "error", err)
 			}
 			delete(m.leases, key)
 		}
@@ -461,7 +486,7 @@ func (m *Manager) tick(now time.Time) {
 		}
 	}
 	for _, lease := range m.leases {
-		if !lease.suppressed {
+		if lease.privacy && !lease.suppressed {
 			raw[lease.camera] = true
 		}
 	}

@@ -15,6 +15,7 @@ type Event struct {
 	Suppressed      bool       `json:"suppressed"`
 	SuppressionRule string     `json:"suppression_rule,omitempty"`
 	StartedAt       time.Time  `json:"started_at"`
+	LastSeenAt      time.Time  `json:"last_seen_at"`
 	EndedAt         *time.Time `json:"ended_at,omitempty"`
 	Details         string     `json:"details,omitempty"`
 }

@@ -31,6 +31,8 @@ trusted_proxies:
   - "172.18.0.0/16"
 
 poll_interval: 2s
+# Inactivity timeout for authenticated Frigate sessions and historical
+# recording_playback audit leases. Playback never activates privacy alerts.
 activity_window: 5m
 snapshot_lease: 75s
 privacy_clear_delay: 30s
