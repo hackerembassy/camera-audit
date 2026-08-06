@@ -247,6 +247,8 @@ func TestRecordingExportAndDownloadEventsDoNotAffectPrivacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var notified []model.Event
+	m.SetRecordingObserver(func(event model.Event) { notified = append(notified, event) })
 	now := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
 	exportID := m.StartHTTP(context.Background(), "recording_export_requested", "workshop", "mode=standard start=100 end=200", "alice", "person", "exact", "http", "192.0.2.1", "browser", now)
 	if exportID == 0 || len(m.liveHTTP) != 0 {
@@ -263,6 +265,20 @@ func TestRecordingExportAndDownloadEventsDoNotAffectPrivacy(t *testing.T) {
 	events, err := s.RecentRecordings(context.Background(), 10, "")
 	if err != nil || len(events) != 2 {
 		t.Fatalf("recording events=%#v err=%v", events, err)
+	}
+	if len(notified) != 2 || notified[0].Kind != "recording_export_requested" || notified[1].Kind != "recording_export_download" {
+		t.Fatalf("recording notifications=%#v", notified)
+	}
+}
+
+func TestRecordingActivityKinds(t *testing.T) {
+	for _, kind := range []string{"recording_playback", "recording_export_requested", "recording_export_download", "recording_download"} {
+		if !isRecordingActivity(kind) {
+			t.Errorf("isRecordingActivity(%q)=false", kind)
+		}
+	}
+	if isRecordingActivity("audit_export_download") {
+		t.Error("audit CSV download must not be a recording notification")
 	}
 }
 

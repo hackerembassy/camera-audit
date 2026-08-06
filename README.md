@@ -17,7 +17,7 @@
 
 Historical recording playback, export creation, and downloads are audited but do not activate privacy alerts. Recording start/end Unix values are rendered as compact, minute-level local ranges in the dashboard and Telegram; raw stored values and history JSON remain unchanged. Review thumbnails and event snapshots remain non-alerting.
 
-Optional Telegram notifications summarize newly started recording playback leases after a configurable delay. Segment refreshes only renew an existing lease, and all distinct playback starts during the delay are delivered as one message, avoiding one notification per request.
+Optional Telegram notifications cover recording playback, export requests, export downloads, and direct recording downloads. The first action sends a formatted message immediately. Further actions during the configurable window edit and extend that message; segment refreshes only renew an existing playback lease.
 
 ## Identity limits
 
@@ -76,7 +76,7 @@ and proxying still start while the MQTT client reconnects in the background.
 
 ## Telegram recording summaries
 
-Create a bot with BotFather, add it to the target chat, and configure `telegram.enabled`, `bot_token`, `chat_id`, and `batch_window`. Keep the token in `CAMERA_AUDIT_TELEGRAM_BOT_TOKEN` rather than committing it. A five-minute window is the default. Each message groups identical actor, camera, route detail, and protocol combinations and reports their counts. Delivery failures are logged and the pending batch is retried; a graceful shutdown makes one final delivery attempt.
+Create a bot with BotFather, add it to the target chat, and configure `telegram.enabled`, `bot_token`, `chat_id`, and `batch_window`. Keep the token in `CAMERA_AUDIT_TELEGRAM_BOT_TOKEN` rather than committing it. A five-minute window is the default. The first recording action sends an HTML-formatted message immediately; each later action within that window edits the same message. Entries identify playback, export requests, export downloads, and direct recording downloads, grouping identical actor, camera, detail, protocol, and action combinations. Delivery failures are logged and retried on the next update and at window close; graceful shutdown makes one final update attempt.
 
 ## Local development
 

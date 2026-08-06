@@ -103,9 +103,10 @@ mqtt:
   # The MQTT account must be allowed to subscribe to
   # camera_audit/+/viewer so stale retained ON states can be cleared.
 
-# Optional delayed summaries for historical recording playback. A playback's
-# many HLS/segment requests are already one audit lease; all new leases during
-# batch_window are combined into a single Telegram message.
+# Optional immediate notifications for recording playback, export requests,
+# export downloads, and direct recording downloads. The first action sends a
+# message immediately; further actions within batch_window edit that message.
+# A playback's many HLS/segment requests are already one audit lease.
 telegram:
   enabled: false
   bot_token: "${CAMERA_AUDIT_TELEGRAM_BOT_TOKEN}"

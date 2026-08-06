@@ -584,7 +584,7 @@ func (m *Manager) StartHTTP(ctx context.Context, kind, camera, details, actor, a
 		m.leases[leaseKey] = activityLease{eventID: id, camera: camera, suppressed: suppressed, privacy: leasePrivacy, expires: now.Add(leaseDuration)}
 		recordingObserver := m.recordingObserver
 		m.mu.Unlock()
-		if kind == "recording_playback" && recordingObserver != nil {
+		if isRecordingActivity(kind) && recordingObserver != nil {
 			e.ID = id
 			recordingObserver(e)
 		}
@@ -594,6 +594,15 @@ func (m *Manager) StartHTTP(ctx context.Context, kind, camera, details, actor, a
 	if err != nil {
 		m.log.Error("persist HTTP camera access", "error", err)
 		return 0
+	}
+	if isRecordingActivity(kind) {
+		m.mu.Lock()
+		recordingObserver := m.recordingObserver
+		m.mu.Unlock()
+		if recordingObserver != nil {
+			e.ID = id
+			recordingObserver(e)
+		}
 	}
 	if kind == "webrtc_signal" {
 		if err := m.store.End(ctx, id, now.UTC()); err != nil {
@@ -606,6 +615,15 @@ func (m *Manager) StartHTTP(ctx context.Context, kind, camera, details, actor, a
 		m.mu.Unlock()
 	}
 	return id
+}
+
+func isRecordingActivity(kind string) bool {
+	switch kind {
+	case "recording_playback", "recording_export_requested", "recording_export_download", "recording_download":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) httpLease(kind, protocol string) (time.Duration, bool) {

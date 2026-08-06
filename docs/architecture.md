@@ -49,7 +49,7 @@ browser / Home Assistant
 | `internal/gateway` | Authentik trust boundary, Frigate reverse proxy, route recognition, WebSocket relay, dashboard, JSON API, and CSV export. |
 | `internal/go2rtc` | Bounded, authenticated reads of `/api/streams` and the diagnostic DOT graph. |
 | `internal/audit` | In-memory reconciliation, identity classification/correlation, leases, Birdseye layout, privacy state, and retention scheduling. |
-| `internal/telegram` | Delayed, grouped Telegram summaries for newly started recording playback leases. |
+| `internal/telegram` | Immediate, incrementally edited Telegram summaries for recording playback, exports, and downloads. |
 | `internal/store` | SQLite schema, lifecycle writes, history queries, startup recovery, and pruning. |
 | `internal/mqttpub` | MQTT discovery, retained state, availability, reconnect recovery, and shutdown cleanup. |
 | `internal/model` | Data transferred between the manager, store, gateway, and JSON clients. |
@@ -72,12 +72,16 @@ Recognized camera routes are passed to `Manager.StartHTTP` before proxying and
 to `Manager.EndHTTP` afterward. The manager handles them in one of three ways:
 
 - WebSocket-like live requests stay open for the request lifetime.
-- Repeated snapshots and recording playback renew an inactivity lease, avoiding
-  one database row per image or HLS request.
+- Repeated snapshots, recording playback, and recording downloads renew an
+  inactivity lease, avoiding one database row per image, segment, or HTTP range.
+- Recording export requests are discrete request-lifetime audit events.
 - WebRTC signaling is recorded as an instantaneous event and placed in a
   15-second correlation window for the polling path.
 
-Recording playback is intentionally auditable but never privacy-active.
+Recording playback, exports, and downloads are intentionally auditable but
+never privacy-active. Each new logical recording action is also offered to the
+Telegram notifier. It sends the first event immediately and edits that message
+as more actions arrive within `telegram.batch_window`.
 
 ### go2rtc reconciliation
 

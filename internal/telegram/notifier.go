@@ -5,10 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -42,8 +42,8 @@ func New(cfg config.Telegram, timezone string, log *slog.Logger) *Notifier {
 	}
 }
 
-// Add queues a new logical recording playback without delaying the proxied
-// request. An overflowing queue is preferable to blocking camera playback.
+// Add queues a new logical recording action without delaying the proxied
+// request. An overflowing queue is preferable to blocking camera access.
 func (n *Notifier) Add(event model.Event) {
 	if !n.cfg.Enabled {
 		return
@@ -60,25 +60,39 @@ func (n *Notifier) Run(ctx context.Context) {
 		<-ctx.Done()
 		return
 	}
-	var pending []model.Event
+	var session []model.Event
+	var messageID int64
+	var dirty bool
 	var timer *time.Timer
 	var timerC <-chan time.Time
+	publish := func(publishCtx context.Context) {
+		id, err := n.publish(publishCtx, session, messageID)
+		if err != nil {
+			n.log.Warn("publish Telegram recording activity", "error", err)
+			return
+		}
+		messageID = id
+		dirty = false
+	}
 	for {
 		select {
 		case event := <-n.events:
-			pending = append(pending, event)
+			session = append(session, event)
+			dirty = true
 			if timer == nil {
 				timer = time.NewTimer(n.cfg.BatchWindow.Value())
 				timerC = timer.C
 			}
+			// The first action sends a new message. Later actions edit that same
+			// message immediately until the session window closes.
+			publish(ctx)
 		case <-timerC:
-			if err := n.send(ctx, pending); err != nil {
-				n.log.Warn("send Telegram recording summary", "error", err)
-				timer.Reset(n.cfg.BatchWindow.Value())
-				timerC = timer.C
-				continue
+			if dirty {
+				publish(ctx)
 			}
-			pending = nil
+			session = nil
+			messageID = 0
+			dirty = false
 			timer = nil
 			timerC = nil
 		case <-ctx.Done():
@@ -88,13 +102,14 @@ func (n *Notifier) Run(ctx context.Context) {
 			for {
 				select {
 				case event := <-n.events:
-					pending = append(pending, event)
+					session = append(session, event)
+					dirty = true
 				default:
-					flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					if err := n.send(flushCtx, pending); err != nil {
-						n.log.Warn("flush Telegram recording summary", "error", err)
+					if dirty {
+						flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+						publish(flushCtx)
+						cancel()
 					}
-					cancel()
 					return
 				}
 			}
@@ -103,29 +118,27 @@ func (n *Notifier) Run(ctx context.Context) {
 }
 
 type summaryKey struct {
-	actor, camera, details, protocol string
+	kind, actor, camera, details, protocol string
 }
 
 func (n *Notifier) message(events []model.Event) string {
 	counts := make(map[summaryKey]int)
+	keys := make([]summaryKey, 0, len(events))
 	for _, event := range events {
 		details := presentation.RecordingDetails(event.Details, n.location)
-		counts[summaryKey{event.Actor, event.Camera, details, event.Protocol}]++
+		key := summaryKey{event.Kind, event.Actor, event.Camera, details, event.Protocol}
+		if counts[key] == 0 {
+			keys = append(keys, key)
+		}
+		counts[key]++
 	}
-	keys := make([]summaryKey, 0, len(counts))
-	for key := range counts {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		a, b := keys[i], keys[j]
-		return a.actor < b.actor || a.actor == b.actor && (a.camera < b.camera || a.camera == b.camera && (a.details < b.details || a.details == b.details && a.protocol < b.protocol))
-	})
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Recording playback summary: %d new session", len(events))
+	fmt.Fprintf(&b, "📼 <b>Recording activity</b>\n<b>%d action", len(events))
 	if len(events) != 1 {
 		b.WriteByte('s')
 	}
+	b.WriteString("</b>")
 	if len(events) > 0 {
 		start, end := events[0].StartedAt, events[0].StartedAt
 		for _, event := range events[1:] {
@@ -136,19 +149,22 @@ func (n *Notifier) message(events []model.Event) string {
 				end = event.StartedAt
 			}
 		}
-		fmt.Fprintf(&b, "\n%s – %s", start.In(n.location).Format("2006-01-02 15:04"), end.In(n.location).Format("15:04 MST"))
+		b.WriteString(" · ")
+		b.WriteString(actionWindow(start.In(n.location), end.In(n.location)))
 	}
 	for _, key := range keys {
-		actor, camera := fallback(key.actor, "Unknown actor"), fallback(key.camera, "unknown camera")
-		line := fmt.Sprintf("\n• %s — %s", actor, camera)
-		if key.details != "" {
-			line += " (" + clean(key.details) + ")"
-		}
+		actor := html.EscapeString(fallback(key.actor, "Unknown actor"))
+		camera := html.EscapeString(fallback(key.camera, "unknown camera"))
+		line := fmt.Sprintf("\n\n• <b>%s</b> — <code>%s</code>", actionLabel(key.kind), camera)
+		line += "\n  " + actor
 		if key.protocol != "" {
-			line += " via " + clean(key.protocol)
+			line += " · <code>" + html.EscapeString(clean(key.protocol)) + "</code>"
+		}
+		if key.details != "" {
+			line += "\n  <code>" + html.EscapeString(clean(key.details)) + "</code>"
 		}
 		if counts[key] > 1 {
-			line += fmt.Sprintf(" ×%d", counts[key])
+			line += fmt.Sprintf(" <b>×%d</b>", counts[key])
 		}
 		if b.Len()+len(line) > maxMessageBytes {
 			b.WriteString("\n• …additional entries omitted")
@@ -157,6 +173,33 @@ func (n *Notifier) message(events []model.Event) string {
 		b.WriteString(line)
 	}
 	return b.String()
+}
+
+func actionLabel(kind string) string {
+	switch kind {
+	case "recording_playback":
+		return "Playback"
+	case "recording_export_requested":
+		return "Export requested"
+	case "recording_export_download":
+		return "Export downloaded"
+	case "recording_download":
+		return "Recording downloaded"
+	default:
+		return "Recording action"
+	}
+}
+
+func actionWindow(start, end time.Time) string {
+	if start.Equal(end) {
+		return start.Format("2006-01-02 15:04 -07")
+	}
+	_, startOffset := start.Zone()
+	_, endOffset := end.Zone()
+	if startOffset == endOffset && start.Year() == end.Year() && start.YearDay() == end.YearDay() {
+		return start.Format("2006-01-02 15:04") + "–" + end.Format("15:04 -07")
+	}
+	return start.Format("2006-01-02 15:04 -07") + "–" + end.Format("2006-01-02 15:04 -07")
 }
 
 func fallback(value, replacement string) string {
@@ -169,28 +212,63 @@ func fallback(value, replacement string) string {
 
 func clean(value string) string { return strings.Join(strings.Fields(value), " ") }
 
-func (n *Notifier) send(ctx context.Context, events []model.Event) error {
+func (n *Notifier) publish(ctx context.Context, events []model.Event, messageID int64) (int64, error) {
 	if len(events) == 0 {
-		return nil
+		return messageID, nil
 	}
-	body, err := json.Marshal(map[string]string{"chat_id": n.cfg.ChatID, "text": n.message(events)})
+	payload := map[string]any{
+		"chat_id": n.cfg.ChatID, "text": n.message(events), "parse_mode": "HTML",
+	}
+	method := "sendMessage"
+	if messageID != 0 {
+		method = "editMessageText"
+		payload["message_id"] = messageID
+	}
+	resultID, err := n.call(ctx, method, payload)
 	if err != nil {
-		return err
+		return messageID, err
 	}
-	url := strings.TrimRight(n.baseURL, "/") + "/bot" + n.cfg.BotToken + "/sendMessage"
+	if messageID != 0 {
+		return messageID, nil
+	}
+	if resultID == 0 {
+		return 0, fmt.Errorf("Telegram sendMessage response omitted message_id")
+	}
+	return resultID, nil
+}
+
+func (n *Notifier) call(ctx context.Context, method string, payload map[string]any) (int64, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err
+	}
+	url := strings.TrimRight(n.baseURL, "/") + "/bot" + n.cfg.BotToken + "/" + method
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	response, err := n.client.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
-		return fmt.Errorf("Telegram API returned %s: %s", response.Status, strings.TrimSpace(string(message)))
+		return 0, fmt.Errorf("Telegram API returned %s: %s", response.Status, strings.TrimSpace(string(message)))
 	}
-	return nil
+	var result struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+		Result      struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&result); err != nil {
+		return 0, fmt.Errorf("decode Telegram API response: %w", err)
+	}
+	if !result.OK {
+		return 0, fmt.Errorf("Telegram API rejected %s: %s", method, result.Description)
+	}
+	return result.Result.MessageID, nil
 }
