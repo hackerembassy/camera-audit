@@ -50,6 +50,7 @@ type ActiveSession struct {
 	Suppressed      bool      `json:"suppressed"`
 	SuppressionRule string    `json:"suppression_rule,omitempty"`
 	StartedAt       time.Time `json:"started_at"`
+	LastSeenAt      time.Time `json:"last_seen_at"`
 	Misses          int       `json:"-"`
 }
 

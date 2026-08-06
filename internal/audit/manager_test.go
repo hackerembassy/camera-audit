@@ -4,9 +4,12 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -230,6 +233,63 @@ func TestCloseTrackedEndsLiveHTTPRequest(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].EndedAt == nil {
 		t.Fatalf("live request was not closed: %#v", events)
+	}
+}
+
+func TestStreamLastSeenIsLiveCheckpointedAndFinalized(t *testing.T) {
+	var present atomic.Bool
+	present.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/streams" {
+			http.NotFound(w, r)
+			return
+		}
+		if present.Load() {
+			_, _ = io.WriteString(w, `{"workshop":{"consumers":[{"id":1,"protocol":"rtsp","remote_addr":"192.0.2.1:1234","user_agent":"mystery-client"}]}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+	s, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	m, err := New(config.Config{Go2RTCURL: server.URL}, s, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	m.poll(ctx)
+	first := m.Current().Sessions[0].LastSeenAt
+	m.mu.Lock()
+	m.lastStreamCheckpoint = time.Now().Add(-streamCheckpointInterval)
+	m.mu.Unlock()
+	time.Sleep(time.Millisecond)
+	m.poll(ctx)
+	current := m.Current()
+	if len(current.Sessions) != 1 || !current.Sessions[0].LastSeenAt.After(first) {
+		t.Fatalf("live last seen did not advance: %#v", current.Sessions)
+	}
+	observed := current.Sessions[0].LastSeenAt
+	events, err := s.RecentStreams(ctx, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || !events[0].LastSeenAt.Equal(observed) {
+		t.Fatalf("checkpointed last seen=%#v, want %v", events, observed)
+	}
+
+	present.Store(false)
+	m.poll(ctx) // First miss is tolerated, without inventing a new observation.
+	m.poll(ctx) // Second miss closes the session.
+	events, err = s.RecentStreams(ctx, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EndedAt == nil || !events[0].LastSeenAt.Equal(observed) {
+		t.Fatalf("finalized stream event=%#v, want last seen %v", events, observed)
 	}
 }
 

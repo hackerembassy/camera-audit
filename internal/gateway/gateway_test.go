@@ -99,6 +99,79 @@ func TestAuditPathBoundaryAndUnknownRoute(t *testing.T) {
 	}
 }
 
+func TestDashboardUserAgentVisibility(t *testing.T) {
+	for _, tt := range []struct {
+		name, actorType, userAgent string
+		expected, visible          bool
+	}{
+		{name: "known expected service", actorType: "service", userAgent: "Frigate", expected: true},
+		{name: "unknown expected client", actorType: "unknown", userAgent: "mystery-client", expected: true, visible: true},
+		{name: "unexpected known client", actorType: "service", userAgent: "HomeAssistant", visible: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dashboardUserAgent(tt.actorType, tt.expected, tt.userAgent)
+			if (got != "") != tt.visible {
+				t.Fatalf("dashboardUserAgent()=%q, visible=%v", got, tt.visible)
+			}
+		})
+	}
+}
+
+func TestDashboardSeparatesRecordingsAndAutoUpdates(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for _, event := range []model.Event{
+		{Kind: "frigate_activity", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: now},
+		{Kind: "recording_playback", Actor: "alice", ActorType: "person", Confidence: "exact", Camera: "workshop", StartedAt: now},
+		{Kind: "stream", Actor: "Unknown (192.0.2.1)", ActorType: "unknown", Confidence: "service/device", Camera: "workshop", UserAgent: "mystery-client", StartedAt: now},
+	} {
+		if _, err := s.Start(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager, err := audit.New(config.Config{}, s, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := &Gateway{manager: manager, store: s, location: time.UTC, log: log}
+	data, err := gateway.dashboardData(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Events) != 1 || data.Events[0].Kind != "frigate_activity" || len(data.Recordings) != 1 || data.Recordings[0].Kind != "recording_playback" {
+		t.Fatalf("dashboard history was not separated: %#v", data)
+	}
+	if len(data.StreamEvents) != 1 || data.StreamEvents[0].UserAgent != "mystery-client" {
+		t.Fatalf("stream user agent missing: %#v", data.StreamEvents)
+	}
+	var page strings.Builder
+	if err := dashboardTemplate.Execute(&page, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"/audit/api/v1/dashboard", "setInterval", "Recording playback history", "User agent"} {
+		if !strings.Contains(page.String(), marker) {
+			t.Errorf("dashboard is missing %q", marker)
+		}
+	}
+}
+
+func TestDashboardOverlaysActiveStreamLastSeenFromMemory(t *testing.T) {
+	persisted := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
+	live := persisted.Add(4*time.Minute + 59*time.Second)
+	events := []model.Event{{ID: 42, Kind: "stream", LastSeenAt: persisted}}
+	sessions := []model.ActiveSession{{EventID: 42, LastSeenAt: live}}
+	overlayActiveStreamLastSeen(events, sessions)
+	if !events[0].LastSeenAt.Equal(live) {
+		t.Fatalf("dashboard history last seen=%v, want live value %v", events[0].LastSeenAt, live)
+	}
+}
+
 func TestParseBirdseyeLayout(t *testing.T) {
 	tests := []struct {
 		name    string

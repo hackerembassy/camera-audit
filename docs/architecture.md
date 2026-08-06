@@ -87,6 +87,14 @@ changes is treated as a reused connection ID: the old event is closed and a new
 one is opened. A missing consumer needs two successful polls before closure so
 a single incomplete snapshot does not create reconnect churn.
 
+Every successful inventory updates the active session's exact in-memory
+`last_seen_at`. Open sessions are checkpointed to SQLite together in one
+transaction every five minutes. A disconnect, reused connection ID, outage
+boundary, or graceful shutdown writes the final observed time immediately;
+`ended_at` records when disappearance was detected and may therefore be later.
+The dashboard overlays active history rows with the in-memory value between
+checkpoints.
+
 A failed poll marks current state stale but does not immediately end sessions.
 On the first successful poll after an outage, all pre-outage sessions are closed
 before rebuilding state because continuity cannot be proven. `/readyz` follows
@@ -140,7 +148,8 @@ The manager's `Run` goroutine owns consumer polling, ticking, and pruning. A
 separate context-bound loop refreshes the optional DOT graph, while HTTP handlers
 can concurrently record activity and signals. SQLite is configured for WAL mode
 but limited to one open connection, giving deterministic ordering for these
-small writes and avoiding SQLite writer contention.
+small writes and avoiding SQLite writer contention. Stream freshness uses one
+five-minute batch transaction rather than one autocommit update per stream poll.
 
 The MQTT publisher has its own mutex because reconnect callbacks are controlled
 by the Paho client. It snapshots state under the lock and performs publishes
@@ -163,7 +172,8 @@ SQLite contains two tables:
 There is intentionally no persisted "active" state to restore. At startup,
 `RecoverOpen` closes every event lacking `ended_at`; the daemon then reconstructs
 truth from gateway traffic and go2rtc. This prevents a crash from leaving a
-permanently active audit interval.
+permanently active audit interval. Recovery preserves the most recent checkpointed
+`last_seen_at` instead of inventing an observation at restart time.
 
 Schema evolution currently happens in `Store.migrate`: create the latest base
 tables, inspect legacy columns, apply compatible changes, then backfill. New
@@ -182,9 +192,10 @@ to defaults.
 | --- | --- | --- |
 | `/healthz` | none | Process liveness. |
 | `/readyz` | none | SQLite reachable and go2rtc state fresh. |
-| `/audit/` | trusted proxy plus identity | Server-rendered dashboard. |
+| `/audit/` | trusted proxy plus identity | Auto-updating dashboard shell. |
 | `/audit/api/v1/current` | trusted proxy plus identity | Current sessions, activity, privacy, Birdseye, and freshness. |
-| `/audit/api/v1/history` | trusted proxy plus identity | Recent events; accepts `limit` and `camera`. |
+| `/audit/api/v1/dashboard` | trusted proxy plus identity | Combined live state and separated dashboard histories. |
+| `/audit/api/v1/history` | trusted proxy plus identity | Recent events; accepts `limit`, `camera`, and `type=frigate\|recordings\|streams`. |
 | `/audit/api/v1/graph` | trusted proxy plus identity | Credential-sanitized go2rtc DOT graph. |
 | `/audit/export.csv` | trusted proxy plus identity | Up to 1,000 recent events, optionally filtered by `camera`. |
 | all other routes | forwarded to Frigate | Proxied and audited when recognized. |

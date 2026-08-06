@@ -25,7 +25,7 @@ func TestEventLifecycleAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	events, err := s.Recent(context.Background(), 10, "")
-	if err != nil || len(events) != 1 || events[0].EndedAt == nil {
+	if err != nil || len(events) != 1 || events[0].EndedAt == nil || !events[0].LastSeenAt.Equal(now) {
 		t.Fatalf("events=%#v err=%v", events, err)
 	}
 }
@@ -105,5 +105,79 @@ INSERT INTO events(kind,actor,actor_type,confidence,started_at,ended_at) VALUES(
 	want := time.Date(2026, 8, 6, 7, 5, 0, 0, time.UTC)
 	if len(events) != 1 || !events[0].LastSeenAt.Equal(want) {
 		t.Fatalf("migrated events=%#v", events)
+	}
+}
+
+func TestBatchCheckpointAndStreamEndPreserveActualLastSeen(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	started := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
+	firstID, err := s.Start(ctx, model.Event{Kind: "stream", Actor: "expected", ActorType: "service", Confidence: "service/device", StartedAt: started})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := s.Start(ctx, model.Event{Kind: "stream", Actor: "unknown", ActorType: "unknown", Confidence: "service/device", StartedAt: started})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := started.Add(5 * time.Minute)
+	if err := s.TouchEvents(ctx, map[int64]time.Time{firstID: observed, secondID: observed}); err != nil {
+		t.Fatal(err)
+	}
+	ended := observed.Add(10 * time.Second)
+	if err := s.EndStream(ctx, firstID, ended, observed); err != nil {
+		t.Fatal(err)
+	}
+	events, err := s.RecentStreams(ctx, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("stream events=%d, want 2", len(events))
+	}
+	for _, event := range events {
+		if !event.LastSeenAt.Equal(observed) {
+			t.Errorf("event %d last_seen=%v, want %v", event.ID, event.LastSeenAt, observed)
+		}
+		if event.ID == firstID && (event.EndedAt == nil || !event.EndedAt.Equal(ended)) {
+			t.Errorf("ended_at=%v, want %v", event.EndedAt, ended)
+		}
+	}
+}
+
+func TestRecentSeparatesRecordingPlayback(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for _, event := range []model.Event{
+		{Kind: "frigate_activity", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: now},
+		{Kind: "recording_playback", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: now},
+		{Kind: "stream", Actor: "unknown", ActorType: "unknown", Confidence: "service/device", StartedAt: now},
+	} {
+		if _, err := s.Start(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	frigate, err := s.RecentNonRecordingFrigate(ctx, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordings, err := s.RecentRecordings(ctx, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frigate) != 1 || frigate[0].Kind != "frigate_activity" {
+		t.Fatalf("non-recording Frigate history=%#v", frigate)
+	}
+	if len(recordings) != 1 || recordings[0].Kind != "recording_playback" {
+		t.Fatalf("recording history=%#v", recordings)
 	}
 }

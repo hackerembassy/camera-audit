@@ -52,6 +52,8 @@ type PrivacyObserver func(camera string, active bool)
 type AvailabilityObserver func(available bool)
 type RecordingObserver func(event model.Event)
 
+const streamCheckpointInterval = 5 * time.Minute
+
 type Manager struct {
 	mu sync.RWMutex
 
@@ -71,6 +73,7 @@ type Manager struct {
 	birdseyeControlConns map[uint64]birdseyeControl
 	nextBirdseyeControl  uint64
 	nextBirdseyeLayout   uint64
+	lastStreamCheckpoint time.Time
 	lastPoll             time.Time
 	fresh                bool
 	dot                  string
@@ -196,7 +199,9 @@ func (m *Manager) closeTracked() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, session := range m.sessions {
-		_ = m.store.End(context.Background(), session.EventID, now)
+		if err := m.store.EndStream(context.Background(), session.EventID, now, session.LastSeenAt); err != nil {
+			m.log.Error("close stream session during shutdown", "error", err)
+		}
 	}
 	for _, activity := range m.activities {
 		if activity.EventID != 0 {
@@ -237,7 +242,7 @@ func (m *Manager) poll(ctx context.Context) {
 		// We cannot prove that a connection survived the observation gap. Close
 		// the old intervals and let this successful snapshot establish new ones.
 		for key, session := range m.sessions {
-			if err := m.store.End(ctx, session.EventID, now); err != nil {
+			if err := m.store.EndStream(ctx, session.EventID, now, session.LastSeenAt); err != nil {
 				m.log.Error("close pre-outage stream session", "error", err)
 			}
 			delete(m.sessions, key)
@@ -251,9 +256,10 @@ func (m *Manager) poll(ctx context.Context) {
 			if existing := m.sessions[key]; existing != nil {
 				if existing.Protocol == c.Protocol && existing.RemoteAddr == hostOnly(c.RemoteAddr) && existing.UserAgent == c.UserAgent {
 					existing.Misses = 0
+					existing.LastSeenAt = now
 					continue
 				}
-				if err := m.store.End(ctx, existing.EventID, now); err != nil {
+				if err := m.store.EndStream(ctx, existing.EventID, now, existing.LastSeenAt); err != nil {
 					m.log.Error("close reused go2rtc connection ID", "error", err)
 				}
 				delete(m.sessions, key)
@@ -273,7 +279,7 @@ func (m *Manager) poll(ctx context.Context) {
 			m.sessions[key] = &model.ActiveSession{Key: key, EventID: id, Camera: camera, ConnectionID: c.ID,
 				Actor: actor, ActorType: actorType, Confidence: confidence, Protocol: c.Protocol,
 				RemoteAddr: hostOnly(c.RemoteAddr), UserAgent: c.UserAgent, Suppressed: suppressed,
-				SuppressionRule: rule, StartedAt: now}
+				SuppressionRule: rule, StartedAt: now, LastSeenAt: now}
 		}
 	}
 	for key, session := range m.sessions {
@@ -286,17 +292,37 @@ func (m *Manager) poll(ctx context.Context) {
 		if session.Misses < 2 {
 			continue
 		}
-		if err := m.store.End(ctx, session.EventID, now); err != nil {
+		if err := m.store.EndStream(ctx, session.EventID, now, session.LastSeenAt); err != nil {
 			m.log.Error("persist stream end", "error", err)
 		}
 		delete(m.sessions, key)
 	}
+	m.checkpointStreamsLocked(ctx, now)
 	m.pruneSignalsLocked(now)
 	availabilityObserver := m.availabilityObserver
 	m.mu.Unlock()
 	if !wasFresh && availabilityObserver != nil {
 		availabilityObserver(true)
 	}
+}
+
+func (m *Manager) checkpointStreamsLocked(ctx context.Context, now time.Time) {
+	if m.lastStreamCheckpoint.IsZero() {
+		m.lastStreamCheckpoint = now
+		return
+	}
+	if now.Sub(m.lastStreamCheckpoint) < streamCheckpointInterval {
+		return
+	}
+	seen := make(map[int64]time.Time, len(m.sessions))
+	for _, session := range m.sessions {
+		seen[session.EventID] = session.LastSeenAt
+	}
+	if err := m.store.TouchEvents(ctx, seen); err != nil {
+		m.log.Error("checkpoint active stream last seen", "error", err)
+		return
+	}
+	m.lastStreamCheckpoint = now
 }
 
 func (m *Manager) runDOT(ctx context.Context) {

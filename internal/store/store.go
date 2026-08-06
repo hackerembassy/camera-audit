@@ -91,7 +91,7 @@ func (s *Store) RecoverOpen(ctx context.Context, at time.Time) error {
 	// Live truth is rebuilt from go2rtc and new gateway traffic. Carrying an
 	// open interval across a process gap would claim continuity we did not see.
 	now := at.UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `UPDATE events SET ended_at=?,last_seen_at=?,details=CASE WHEN details='' THEN 'closed after daemon restart' ELSE details END WHERE ended_at IS NULL`, now, now)
+	_, err := s.db.ExecContext(ctx, `UPDATE events SET ended_at=?,last_seen_at=COALESCE(last_seen_at,started_at),details=CASE WHEN details='' THEN 'closed after daemon restart' ELSE details END WHERE ended_at IS NULL`, now)
 	return err
 }
 
@@ -112,8 +112,18 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, e.Kind, e.Actor, e.ActorType, e.Confidence, 
 }
 
 func (s *Store) End(ctx context.Context, id int64, at time.Time) error {
-	now := at.UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `UPDATE events SET ended_at=?,last_seen_at=CASE WHEN last_seen_at IS NULL OR last_seen_at<? THEN ? ELSE last_seen_at END WHERE id=? AND ended_at IS NULL`, now, now, now, id)
+	return s.EndStream(ctx, id, at, at)
+}
+
+// EndStream records when disappearance was detected separately from the last
+// inventory that actually contained the consumer.
+func (s *Store) EndStream(ctx context.Context, id int64, endedAt, lastSeenAt time.Time) error {
+	if lastSeenAt.IsZero() {
+		lastSeenAt = endedAt
+	}
+	ended := endedAt.UTC().Format(time.RFC3339Nano)
+	seen := lastSeenAt.UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `UPDATE events SET ended_at=?,last_seen_at=CASE WHEN last_seen_at IS NULL OR last_seen_at<? THEN ? ELSE last_seen_at END WHERE id=? AND ended_at IS NULL`, ended, seen, seen, id)
 	return err
 }
 
@@ -124,6 +134,32 @@ func (s *Store) TouchEvent(ctx context.Context, id int64, at time.Time) error {
 	now := at.UTC().Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(ctx, `UPDATE events SET last_seen_at=CASE WHEN last_seen_at IS NULL OR last_seen_at<? THEN ? ELSE last_seen_at END WHERE id=? AND ended_at IS NULL`, now, now, id)
 	return err
+}
+
+// TouchEvents checkpoints multiple active events in one SQLite transaction.
+// The caller supplies each event's actual observation time, which may differ
+// when a consumer has missed one inventory but has not yet been closed.
+func (s *Store) TouchEvents(ctx context.Context, seen map[int64]time.Time) error {
+	if len(seen) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	statement, err := tx.PrepareContext(ctx, `UPDATE events SET last_seen_at=CASE WHEN last_seen_at IS NULL OR last_seen_at<? THEN ? ELSE last_seen_at END WHERE id=? AND ended_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	defer statement.Close()
+	for id, at := range seen {
+		value := at.UTC().Format(time.RFC3339Nano)
+		if _, err := statement.ExecContext(ctx, value, value, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) TouchActivity(ctx context.Context, a model.Activity) error {
@@ -140,6 +176,14 @@ func (s *Store) Recent(ctx context.Context, limit int, camera string) ([]model.E
 
 func (s *Store) RecentFrigate(ctx context.Context, limit int, camera string) ([]model.Event, error) {
 	return s.recent(ctx, limit, camera, "kind<>'stream'")
+}
+
+func (s *Store) RecentNonRecordingFrigate(ctx context.Context, limit int, camera string) ([]model.Event, error) {
+	return s.recent(ctx, limit, camera, "kind<>'stream' AND kind<>'recording_playback'")
+}
+
+func (s *Store) RecentRecordings(ctx context.Context, limit int, camera string) ([]model.Event, error) {
+	return s.recent(ctx, limit, camera, "kind='recording_playback'")
 }
 
 func (s *Store) RecentStreams(ctx context.Context, limit int, camera string) ([]model.Event, error) {
