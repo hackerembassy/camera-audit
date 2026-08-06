@@ -87,7 +87,9 @@ func frigateTransport(cfg config.Config) (*http.Transport, *tls.Config, error) {
 		tlsConfig.RootCAs = roots
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = tlsConfig
+	// net/http may add h2 to its TLS config. Keep the reusable template
+	// separate because Gorilla's WebSocket upgrade requires HTTP/1.1 ALPN.
+	transport.TLSClientConfig = tlsConfig.Clone()
 	return transport, tlsConfig, nil
 }
 

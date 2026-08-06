@@ -40,7 +40,9 @@ func (g *Gateway) serveFrigateControlWebSocket(w http.ResponseWriter, r *http.Re
 	dialer := *websocket.DefaultDialer
 	dialer.EnableCompression = true
 	dialer.Subprotocols = websocket.Subprotocols(r)
-	dialer.TLSClientConfig = g.tls.Clone()
+	webSocketTLS := g.tls.Clone()
+	webSocketTLS.NextProtos = []string{"http/1.1"}
+	dialer.TLSClientConfig = webSocketTLS
 	upstream, response, err := dialer.DialContext(r.Context(), upstreamURL.String(), headers)
 	if err != nil {
 		g.writeWebSocketUpstreamError(w, response, err)

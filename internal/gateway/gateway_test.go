@@ -98,7 +98,7 @@ func TestParseBirdseyeLayout(t *testing.T) {
 func TestFrigateControlWebSocketRelayObservesLayout(t *testing.T) {
 	const layoutMessage = `{"topic":"birdseye_layout","payload":"{\"workshop\":{\"x\":0},\"hall\":{\"x\":100}}"}`
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/ws" {
 			http.NotFound(w, r)
 			return
@@ -121,6 +121,8 @@ func TestFrigateControlWebSocketRelayObservesLayout(t *testing.T) {
 		}
 		_ = conn.WriteMessage(messageType, message)
 	}))
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
 	defer upstream.Close()
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
