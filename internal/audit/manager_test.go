@@ -237,6 +237,35 @@ func TestRecordingPlaybackIsLeasedWithoutPrivacyAlert(t *testing.T) {
 	}
 }
 
+func TestRecordingExportAndDownloadEventsDoNotAffectPrivacy(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	m, err := New(config.Config{ActivityWindow: config.Duration(time.Minute)}, s, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
+	exportID := m.StartHTTP(context.Background(), "recording_export_requested", "workshop", "mode=standard start=100 end=200", "alice", "person", "exact", "http", "192.0.2.1", "browser", now)
+	if exportID == 0 || len(m.liveHTTP) != 0 {
+		t.Fatalf("export event id=%d liveHTTP=%v", exportID, m.liveHTTP)
+	}
+	m.EndHTTP(context.Background(), exportID, now.Add(time.Second))
+	if id := m.StartHTTP(context.Background(), "recording_export_download", "", "export_file=one.mp4", "alice", "person", "exact", "http", "192.0.2.1", "browser", now); id != 0 {
+		t.Fatalf("leased download returned event id %d", id)
+	}
+	m.tick(now.Add(time.Second))
+	if m.Current().Privacy["workshop"] || m.Current().Privacy[""] {
+		t.Fatalf("recording actions activated privacy: %v", m.Current().Privacy)
+	}
+	events, err := s.RecentRecordings(context.Background(), 10, "")
+	if err != nil || len(events) != 2 {
+		t.Fatalf("recording events=%#v err=%v", events, err)
+	}
+}
+
 func TestConcurrentIdenticalRequestsCreateOneLease(t *testing.T) {
 	s, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
 	if err != nil {

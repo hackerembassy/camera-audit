@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +26,7 @@ import (
 	"xkem.am/camera-audit/internal/audit"
 	"xkem.am/camera-audit/internal/config"
 	"xkem.am/camera-audit/internal/model"
+	"xkem.am/camera-audit/internal/presentation"
 	"xkem.am/camera-audit/internal/store"
 )
 
@@ -113,6 +117,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
+		if r.URL.Path == "/audit/export.csv" {
+			g.serveAuditedCSVExport(w, r, identity, trusted)
+			return
+		}
 		g.serveAudit(w, r)
 		return
 	}
@@ -133,12 +141,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.manager.RecordActivity(r.Context(), actor, remote, ua, now)
 	}
 
-	kind, camera, protocol, details := cameraAccess(r)
-	var eventID int64
-	if kind != "" {
-		eventID = g.manager.StartHTTP(r.Context(), kind, camera, details, actor, actorType, confidence, protocol, remote, ua, now)
-		if kind == "webrtc_signal" || kind == "mse" || (kind == "birdseye_live" && protocol == "ws") {
-			g.manager.RecordSignal(r.Context(), camera, actor, actorType, "correlated", remote, ua, now)
+	accesses := requestAccesses(r)
+	eventIDs := make([]int64, 0, len(accesses))
+	for _, access := range accesses {
+		eventID := g.manager.StartHTTP(r.Context(), access.kind, access.camera, access.details, actor, actorType, confidence, access.protocol, remote, ua, now)
+		if eventID != 0 {
+			eventIDs = append(eventIDs, eventID)
+		}
+		if access.kind == "webrtc_signal" || access.kind == "mse" || (access.kind == "birdseye_live" && access.protocol == "ws") {
+			g.manager.RecordSignal(r.Context(), access.camera, actor, actorType, "correlated", remote, ua, now)
 		}
 	}
 	if isFrigateControlWebSocket(r) {
@@ -146,6 +157,21 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		g.proxy.ServeHTTP(w, r)
 	}
+	endedAt := time.Now().UTC()
+	for _, eventID := range eventIDs {
+		g.manager.EndHTTP(context.Background(), eventID, endedAt)
+	}
+}
+
+func (g *Gateway) serveAuditedCSVExport(w http.ResponseWriter, r *http.Request, actor string, trusted bool) {
+	now := time.Now().UTC()
+	details := "scope=all"
+	if camera := auditToken(r.URL.Query().Get("camera")); camera != "" {
+		details = "camera=" + camera
+	}
+	eventID := g.manager.StartHTTP(r.Context(), "audit_export_download", "", details, actor, "person", "exact", "csv",
+		g.clientIP(r, trusted), r.UserAgent(), now)
+	g.exportCSV(w, r)
 	if eventID != 0 {
 		g.manager.EndHTTP(context.Background(), eventID, time.Now().UTC())
 	}
@@ -168,8 +194,31 @@ func stripProxyIdentity(h http.Header, configured string) {
 	}
 }
 
+type httpAccess struct {
+	kind, camera, protocol, details string
+}
+
+const (
+	maxInspectedExportBody = 1 << 20
+	maxBatchExportItems    = 50
+)
+
+func requestAccesses(r *http.Request) []httpAccess {
+	if r.Method == http.MethodPost && r.URL.Path == "/api/exports/batch" {
+		return batchExportAccesses(r)
+	}
+	kind, camera, protocol, details := cameraAccess(r)
+	if kind == "" {
+		return nil
+	}
+	return []httpAccess{{kind: kind, camera: camera, protocol: protocol, details: details}}
+}
+
 func cameraAccess(r *http.Request) (kind, camera, protocol, details string) {
 	p := r.URL.Path
+	if kind, camera, protocol, details, ok := recordingAction(r.Method, p); ok {
+		return kind, camera, protocol, details
+	}
 	if camera, protocol, details, ok := recordingPlayback(p); ok {
 		return "recording_playback", camera, protocol, details
 	}
@@ -200,6 +249,86 @@ func cameraAccess(r *http.Request) (kind, camera, protocol, details string) {
 		}
 	}
 	return "", "", "", ""
+}
+
+func recordingAction(method, requestPath string) (kind, camera, protocol, details string, ok bool) {
+	parts := strings.Split(strings.Trim(requestPath, "/"), "/")
+	if method == http.MethodPost && len(parts) >= 7 && parts[0] == "api" && parts[1] == "export" {
+		if parts[2] == "custom" && len(parts) >= 8 && parts[4] == "start" && parts[6] == "end" {
+			return "recording_export_requested", auditToken(parts[3]), "http",
+				"mode=custom start=" + auditToken(parts[5]) + " end=" + auditToken(parts[7]), true
+		}
+		if parts[3] == "start" && parts[5] == "end" {
+			return "recording_export_requested", auditToken(parts[2]), "http",
+				"mode=standard start=" + auditToken(parts[4]) + " end=" + auditToken(parts[6]), true
+		}
+	}
+	if method != http.MethodGet {
+		return "", "", "", "", false
+	}
+	if len(parts) == 2 && parts[0] == "exports" && strings.EqualFold(path.Ext(parts[1]), ".mp4") {
+		return "recording_export_download", "", "http", "export_file=" + auditToken(path.Base(parts[1])), true
+	}
+	if len(parts) == 4 && parts[0] == "api" && parts[1] == "cases" && parts[3] == "download" {
+		return "recording_export_download", "", "zip", "export_case=" + auditToken(parts[2]), true
+	}
+	if len(parts) >= 5 && parts[0] == "recordings" && strings.EqualFold(path.Ext(parts[len(parts)-1]), ".mp4") {
+		return "recording_download", auditToken(parts[3]), "http",
+			"date=" + auditToken(parts[1]) + " hour=" + auditToken(parts[2]) + " file=" + auditToken(path.Base(parts[len(parts)-1])), true
+	}
+	return "", "", "", "", false
+}
+
+type replayReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+func batchExportAccesses(r *http.Request) []httpAccess {
+	if r.Body == nil {
+		return []httpAccess{{kind: "recording_export_requested", protocol: "http", details: "mode=batch metadata=missing"}}
+	}
+	original := r.Body
+	prefix, err := io.ReadAll(io.LimitReader(original, maxInspectedExportBody+1))
+	r.Body = replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), original), Closer: original}
+	if err != nil || len(prefix) > maxInspectedExportBody {
+		return []httpAccess{{kind: "recording_export_requested", protocol: "http", details: "mode=batch metadata=unavailable"}}
+	}
+	var body struct {
+		Items []struct {
+			Camera    string  `json:"camera"`
+			StartTime float64 `json:"start_time"`
+			EndTime   float64 `json:"end_time"`
+		} `json:"items"`
+	}
+	if json.Unmarshal(prefix, &body) != nil || len(body.Items) == 0 || len(body.Items) > maxBatchExportItems {
+		return []httpAccess{{kind: "recording_export_requested", protocol: "http", details: "mode=batch metadata=invalid"}}
+	}
+	accesses := make([]httpAccess, 0, len(body.Items))
+	for index, item := range body.Items {
+		accesses = append(accesses, httpAccess{
+			kind: "recording_export_requested", camera: auditToken(item.Camera), protocol: "http",
+			details: fmt.Sprintf("mode=batch item=%d/%d start=%s end=%s", index+1, len(body.Items),
+				strconv.FormatFloat(item.StartTime, 'f', -1, 64), strconv.FormatFloat(item.EndTime, 'f', -1, 64)),
+		})
+	}
+	return accesses
+}
+
+func auditToken(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, value)
+	const maxRunes = 256
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		value = string(runes[:maxRunes])
+	}
+	return value
 }
 
 func recordingPlayback(requestPath string) (camera, protocol, details string, ok bool) {
@@ -450,9 +579,13 @@ func (g *Gateway) dashboardActivities(activities []model.Activity) []dashboardAc
 func (g *Gateway) dashboardEvents(events []model.Event) []dashboardEvent {
 	out := make([]dashboardEvent, 0, len(events))
 	for _, event := range events {
+		details := event.Details
+		if strings.HasPrefix(event.Kind, "recording_") {
+			details = presentation.RecordingDetails(details, g.location)
+		}
 		out = append(out, dashboardEvent{
 			Kind: event.Kind, Camera: event.Camera, Actor: event.Actor, Protocol: event.Protocol,
-			Details: event.Details, UserAgent: dashboardUserAgent(event.ActorType, event.Suppressed, event.UserAgent),
+			Details: details, UserAgent: dashboardUserAgent(event.ActorType, event.Suppressed, event.UserAgent),
 			Expected:   event.Suppressed,
 			StartedAt:  g.dashboardTime(event.StartedAt),
 			LastSeenAt: g.dashboardTime(event.LastSeenAt),
@@ -561,7 +694,7 @@ code{font-size:.85em}.ua{max-width:34rem;overflow-wrap:anywhere}.muted{color:#6b
 <h2>Active Frigate users</h2><div class="table-wrap"><table><thead><tr><th>User</th><th>Remote</th><th>Last activity</th></tr></thead><tbody id="activity-rows"></tbody></table></div>
 <h2>Recent Frigate and viewer activity</h2><p><a href="/audit/export.csv">Export all CSV</a> · <a href="/audit/api/v1/history">All history JSON</a> · <a href="/audit/api/v1/current">Current JSON</a></p>
 <div class="table-wrap"><table><thead><tr><th>Last seen</th><th>Started</th><th>Kind</th><th>Camera</th><th>Actor</th><th>Details</th><th>Expected</th></tr></thead><tbody id="event-rows"></tbody></table></div>
-<h2>Recording playback history</h2><div class="table-wrap"><table><thead><tr><th>Last seen</th><th>Started</th><th>Camera</th><th>Actor</th><th>Protocol</th><th>Details</th></tr></thead><tbody id="recording-rows"></tbody></table></div>
+<h2>Recording activity history</h2><div class="table-wrap"><table><thead><tr><th>Last seen</th><th>Started</th><th>Kind</th><th>Camera</th><th>Actor</th><th>Protocol</th><th>Details</th></tr></thead><tbody id="recording-rows"></tbody></table></div>
 <h2>Recent go2rtc session history</h2><div class="table-wrap"><table><thead><tr><th>State / last seen</th><th>Started</th><th>Camera</th><th>Actor</th><th>Protocol</th><th>User agent</th><th>Expected</th></tr></thead><tbody id="stream-rows"></tbody></table></div>
 <script>
 (function () {
@@ -624,8 +757,8 @@ code{font-size:.85em}.ua{max-width:34rem;overflow-wrap:anywhere}.muted{color:#6b
     renderRows("event-rows", data.events, 7, function (row, item) {
       addCell(row, item.last_seen_at); addCell(row, item.started_at); addCell(row, item.kind); addCell(row, item.camera); addCell(row, item.actor); addCell(row, item.details, "", true); addExpected(row, item.expected);
     });
-    renderRows("recording-rows", data.recordings, 6, function (row, item) {
-      addCell(row, item.last_seen_at); addCell(row, item.started_at); addCell(row, item.camera); addCell(row, item.actor); addCell(row, item.protocol); addCell(row, item.details, "", true);
+    renderRows("recording-rows", data.recordings, 7, function (row, item) {
+      addCell(row, item.last_seen_at); addCell(row, item.started_at); addCell(row, item.kind); addCell(row, item.camera); addCell(row, item.actor); addCell(row, item.protocol); addCell(row, item.details, "", true);
     });
     renderRows("stream-rows", data.stream_events, 7, function (row, item) {
       addCell(row, item.live ? "live" : item.last_seen_at, item.live ? "ok" : ""); addCell(row, item.started_at); addCell(row, item.camera); addCell(row, item.actor); addCell(row, item.protocol); addCell(row, item.user_agent, "ua", true); addExpected(row, item.expected);

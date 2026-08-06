@@ -600,7 +600,7 @@ func (m *Manager) StartHTTP(ctx context.Context, kind, camera, details, actor, a
 			m.log.Error("persist WebRTC signal end", "error", err)
 		}
 		return 0
-	} else {
+	} else if httpAccessAffectsPrivacy(kind) {
 		m.mu.Lock()
 		m.liveHTTP[id] = liveHTTP{camera: camera, suppressed: suppressed}
 		m.mu.Unlock()
@@ -617,10 +617,19 @@ func (m *Manager) httpLease(kind, protocol string) (time.Duration, bool) {
 			return m.cfg.SnapshotLease.Value(), true
 		}
 		return 0, false
-	case "recording_playback":
+	case "recording_playback", "recording_export_download", "recording_download":
 		return m.cfg.ActivityWindow.Value(), false
 	default:
 		return 0, false
+	}
+}
+
+func httpAccessAffectsPrivacy(kind string) bool {
+	switch kind {
+	case "jsmpeg", "mse", "birdseye_live":
+		return true
+	default:
+		return false
 	}
 }
 

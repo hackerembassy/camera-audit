@@ -14,6 +14,7 @@ import (
 
 	"xkem.am/camera-audit/internal/config"
 	"xkem.am/camera-audit/internal/model"
+	"xkem.am/camera-audit/internal/presentation"
 )
 
 // Telegram accepts up to 4096 characters. A byte limit leaves room for the
@@ -108,7 +109,8 @@ type summaryKey struct {
 func (n *Notifier) message(events []model.Event) string {
 	counts := make(map[summaryKey]int)
 	for _, event := range events {
-		counts[summaryKey{event.Actor, event.Camera, event.Details, event.Protocol}]++
+		details := presentation.RecordingDetails(event.Details, n.location)
+		counts[summaryKey{event.Actor, event.Camera, details, event.Protocol}]++
 	}
 	keys := make([]summaryKey, 0, len(counts))
 	for key := range counts {

@@ -18,11 +18,11 @@ func TestMessageGroupsRecordingPlayback(t *testing.T) {
 	n := New(config.Telegram{}, "Asia/Yerevan", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	at := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
 	message := n.message([]model.Event{
-		{Actor: "alice", Camera: "workshop", Details: "start=100 end=200", Protocol: "hls", StartedAt: at},
-		{Actor: "alice", Camera: "workshop", Details: "start=100 end=200", Protocol: "hls", StartedAt: at.Add(time.Minute)},
+		{Actor: "alice", Camera: "workshop", Details: "start=1786001400 end=1786002300", Protocol: "hls", StartedAt: at},
+		{Actor: "alice", Camera: "workshop", Details: "start=1786001400 end=1786002300", Protocol: "hls", StartedAt: at.Add(time.Minute)},
 		{Actor: "bob", Details: "event=abc", Protocol: "http", StartedAt: at.Add(2 * time.Minute)},
 	})
-	for _, want := range []string{"3 new sessions", "11:00 – 11:02 +04", "alice — workshop (start=100 end=200) via hls ×2", "bob — unknown camera (event=abc) via http"} {
+	for _, want := range []string{"3 new sessions", "11:00 – 11:02 +04", "alice — workshop (range=2026-08-06 11:30–11:45 +04) via hls ×2", "bob — unknown camera (event=abc) via http"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("message %q does not contain %q", message, want)
 		}

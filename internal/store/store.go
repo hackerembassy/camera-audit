@@ -189,11 +189,11 @@ func (s *Store) RecentFrigate(ctx context.Context, limit int, camera string) ([]
 }
 
 func (s *Store) RecentNonRecordingFrigate(ctx context.Context, limit int, camera string) ([]model.Event, error) {
-	return s.recent(ctx, limit, camera, "kind<>'stream' AND kind<>'recording_playback'")
+	return s.recent(ctx, limit, camera, "kind<>'stream' AND kind NOT IN ('recording_playback','recording_export_requested','recording_export_download','recording_download')")
 }
 
 func (s *Store) RecentRecordings(ctx context.Context, limit int, camera string) ([]model.Event, error) {
-	return s.recent(ctx, limit, camera, "kind='recording_playback'")
+	return s.recent(ctx, limit, camera, "kind IN ('recording_playback','recording_export_requested','recording_export_download','recording_download')")
 }
 
 func (s *Store) RecentStreams(ctx context.Context, limit int, camera string) ([]model.Event, error) {

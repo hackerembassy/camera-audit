@@ -180,7 +180,7 @@ func TestBatchCheckpointAndStreamEndPreserveActualLastSeen(t *testing.T) {
 	}
 }
 
-func TestRecentSeparatesRecordingPlayback(t *testing.T) {
+func TestRecentSeparatesRecordingActivity(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "audit.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -191,6 +191,9 @@ func TestRecentSeparatesRecordingPlayback(t *testing.T) {
 	for _, event := range []model.Event{
 		{Kind: "frigate_activity", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: now},
 		{Kind: "recording_playback", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: now},
+		{Kind: "recording_export_requested", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: now},
+		{Kind: "recording_export_download", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: now},
+		{Kind: "recording_download", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: now},
 		{Kind: "stream", Actor: "unknown", ActorType: "unknown", Confidence: "service/device", StartedAt: now},
 	} {
 		if _, err := s.Start(ctx, event); err != nil {
@@ -208,7 +211,7 @@ func TestRecentSeparatesRecordingPlayback(t *testing.T) {
 	if len(frigate) != 1 || frigate[0].Kind != "frigate_activity" {
 		t.Fatalf("non-recording Frigate history=%#v", frigate)
 	}
-	if len(recordings) != 1 || recordings[0].Kind != "recording_playback" {
+	if len(recordings) != 4 {
 		t.Fatalf("recording history=%#v", recordings)
 	}
 }
