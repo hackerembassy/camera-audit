@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Overview · Camera access audit</title>
+<link rel="stylesheet" href="/audit/assets/audit.css">
+<script defer src="https://cdn.jsdelivr.net/npm/vis-network@10.0.2/standalone/umd/vis-network.min.js"></script>
+<script defer src="/audit/assets/common.js"></script><script defer src="/audit/assets/overview.js"></script>
+</head><body>
+<header class="topbar"><div class="shell topbar-inner"><a class="brand" href="/audit/">Camera access audit</a><nav class="primary-nav" aria-label="Audit pages"><a href="/audit/" aria-current="page">Overview</a><a href="/audit/history">History</a><a href="/audit/api/v1/current">JSON/API</a></nav></div></header>
+<div class="section-bar"><nav class="shell section-nav" aria-label="Overview sections"><a href="#status">Status</a><a href="#privacy">Privacy</a><a href="#consumers">Consumers</a><a href="#graph">Graph</a><a href="#users">Users</a></nav></div>
+<main class="shell">
+<div class="page-header"><div><h1>Live overview</h1><p class="meta">Current camera access and viewer state, updated every five seconds.</p></div><a class="button" href="/audit/history">View history</a></div>
+<section id="status" class="status-card" aria-live="polite"><strong>go2rtc state: <span id="fresh-state" class="muted">loading</span></strong><span class="meta"> · last poll <span id="last-poll">loading</span> · <span id="update-state">updating</span></span><p class="meta">Displayed timezone: <strong id="timezone">loading</strong>. JSON API timestamps remain UTC.</p><p class="meta">Birdseye layout: <strong id="birdseye-source">loading</strong><span id="birdseye-layout"></span></p></section>
+<section id="privacy"><h2>Room privacy alerts</h2><div class="table-wrap"><table><thead><tr><th>Camera</th><th>State</th></tr></thead><tbody id="privacy-rows"></tbody></table></div></section>
+<section id="consumers"><h2>Current go2rtc consumers</h2><p class="meta section-copy">Oldest first by daemon observation; go2rtc does not expose connection-since time.</p><div class="table-wrap"><table><thead><tr><th>Last seen</th><th>First observed</th><th>Camera</th><th>Actor</th><th>Confidence</th><th>Protocol</th><th>Remote</th><th>User agent</th><th>Expected</th></tr></thead><tbody id="session-rows"></tbody></table></div></section>
+<section id="graph"><h2>go2rtc connection graph</h2><p class="meta section-copy"><span id="graph-state">Loading sanitized graph</span> · <a href="/audit/api/v1/graph">Raw DOT</a></p><div id="go2rtc-graph" class="graph-wrap" aria-live="polite"></div></section>
+<section id="users"><h2>Active Frigate users</h2><div class="table-wrap"><table><thead><tr><th>User</th><th>Remote</th><th>Last activity</th></tr></thead><tbody id="activity-rows"></tbody></table></div></section>
+<p class="footer-links"><a href="/audit/api/v1/live">Live JSON</a> · <a href="/audit/api/v1/current">Raw current JSON</a></p>
+</main></body></html>

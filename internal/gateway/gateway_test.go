@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,42 +129,6 @@ func TestOversizedBatchExportBodyIsRestoredWithoutParsing(t *testing.T) {
 	}
 }
 
-func TestConfiguredTimezoneFormatsHumanAndCSVTimes(t *testing.T) {
-	location, err := time.LoadLocation("Asia/Yerevan")
-	if err != nil {
-		t.Fatal(err)
-	}
-	gateway := &Gateway{location: location}
-	value := time.Date(2026, 8, 6, 7, 30, 0, 0, time.UTC)
-	if got, want := gateway.csvTime(value), "2026-08-06T11:30:00+04:00"; got != want {
-		t.Fatalf("csvTime=%q, want %q", got, want)
-	}
-	if got, want := gateway.dashboardTime(value), "2026-08-06 11:30:00 +04:00"; got != want {
-		t.Fatalf("dashboardTime=%q, want %q", got, want)
-	}
-	if got := gateway.dashboardTime(time.Time{}); got != "never" {
-		t.Fatalf("zero dashboard time=%q", got)
-	}
-}
-
-func TestDashboardFormatsRecordingRangeWithoutChangingOtherDetails(t *testing.T) {
-	location, err := time.LoadLocation("Asia/Yerevan")
-	if err != nil {
-		t.Fatal(err)
-	}
-	gateway := &Gateway{location: location}
-	events := gateway.dashboardEvents([]model.Event{
-		{Kind: "recording_playback", Details: "start=1786001400 end=1786002300"},
-		{Kind: "frigate_request", Details: "start=1786001400 end=1786002300"},
-	})
-	if got, want := events[0].Details, "range=2026-08-06 11:30–11:45 +04"; got != want {
-		t.Fatalf("recording details=%q, want %q", got, want)
-	}
-	if got, want := events[1].Details, "start=1786001400 end=1786002300"; got != want {
-		t.Fatalf("non-recording details=%q, want %q", got, want)
-	}
-}
-
 func TestStripProxyIdentity(t *testing.T) {
 	h := http.Header{
 		"X-Authentik-Username": []string{"mallory"},
@@ -179,7 +144,7 @@ func TestStripProxyIdentity(t *testing.T) {
 	}
 }
 
-func TestAuditPathBoundaryAndUnknownRoute(t *testing.T) {
+func TestAuditPathBoundary(t *testing.T) {
 	for requestPath, want := range map[string]bool{
 		"/audit": true, "/audit/": true, "/audit/api/v1/current": true,
 		"/auditor": false, "/audit-log": false,
@@ -188,90 +153,33 @@ func TestAuditPathBoundaryAndUnknownRoute(t *testing.T) {
 			t.Errorf("isAuditPath(%q)=%v, want %v", requestPath, got, want)
 		}
 	}
+}
+
+func TestAuditDelegationRequiresTrustedIdentity(t *testing.T) {
+	called := false
+	gateway := &Gateway{
+		cfg:     config.Config{IdentityHeader: "X-authentik-username"},
+		trusted: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")},
+		auditWeb: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/audit/", nil)
+	request.Header.Set("X-authentik-username", "alice")
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/audit/api/v1/unknown", nil)
-	(&Gateway{}).serveAudit(recorder, request)
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("unknown audit route status=%d, want %d", recorder.Code, http.StatusNotFound)
+	gateway.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent || !called {
+		t.Fatalf("authenticated audit request was not delegated: status=%d called=%v", recorder.Code, called)
 	}
-}
 
-func TestDashboardUserAgentVisibility(t *testing.T) {
-	for _, tt := range []struct {
-		name, actorType, userAgent string
-		expected, visible          bool
-	}{
-		{name: "known expected service", actorType: "service", userAgent: "Frigate", expected: true},
-		{name: "unknown expected client", actorType: "unknown", userAgent: "mystery-client", expected: true, visible: true},
-		{name: "unexpected known client", actorType: "service", userAgent: "HomeAssistant", visible: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			got := dashboardUserAgent(tt.actorType, tt.expected, tt.userAgent)
-			if (got != "") != tt.visible {
-				t.Fatalf("dashboardUserAgent()=%q, visible=%v", got, tt.visible)
-			}
-		})
-	}
-}
-
-func TestDashboardSeparatesRecordingsAndAutoUpdates(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	ctx := context.Background()
-	now := time.Now().UTC()
-	for _, event := range []model.Event{
-		{Kind: "frigate_activity", Actor: "alice", ActorType: "person", Confidence: "exact", StartedAt: now},
-		{Kind: "recording_playback", Actor: "alice", ActorType: "person", Confidence: "exact", Camera: "workshop", StartedAt: now},
-		{Kind: "recording_export_requested", Actor: "alice", ActorType: "person", Confidence: "exact", Camera: "workshop", StartedAt: now},
-		{Kind: "stream", Actor: "Unknown (192.0.2.1)", ActorType: "unknown", Confidence: "service/device", Camera: "workshop", UserAgent: "mystery-client", StartedAt: now},
-	} {
-		if _, err := s.Start(ctx, event); err != nil {
-			t.Fatal(err)
-		}
-	}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager, err := audit.New(config.Config{}, s, log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gateway := &Gateway{manager: manager, store: s, location: time.UTC, log: log}
-	data, err := gateway.dashboardData(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(data.Events) != 1 || data.Events[0].Kind != "frigate_activity" || len(data.Recordings) != 2 {
-		t.Fatalf("dashboard history was not separated: %#v", data)
-	}
-	if len(data.StreamEvents) != 1 || data.StreamEvents[0].UserAgent != "mystery-client" {
-		t.Fatalf("stream user agent missing: %#v", data.StreamEvents)
-	}
-	var page strings.Builder
-	if err := dashboardTemplate.Execute(&page, nil); err != nil {
-		t.Fatal(err)
-	}
-	for _, marker := range []string{"/audit/api/v1/dashboard", "setInterval", "Recording activity history", "User agent", "First observed", "vis.parseDOTNetwork", "vis-network@10.0.2"} {
-		if !strings.Contains(page.String(), marker) {
-			t.Errorf("dashboard is missing %q", marker)
-		}
-	}
-}
-
-func TestDashboardOverlaysActiveStreamLastSeenFromMemory(t *testing.T) {
-	persisted := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
-	live := persisted.Add(4*time.Minute + 59*time.Second)
-	events := []model.Event{{ID: 42, Kind: "stream", LastSeenAt: persisted}}
-	sessions := []model.ActiveSession{{EventID: 42, LastSeenAt: live}}
-	active := overlayActiveStreamLastSeen(events, sessions)
-	if !events[0].LastSeenAt.Equal(live) {
-		t.Fatalf("dashboard history last seen=%v, want live value %v", events[0].LastSeenAt, live)
-	}
-	gateway := &Gateway{location: time.UTC}
-	rows := gateway.dashboardStreamEvents(events, active)
-	if len(rows) != 1 || !rows[0].Live {
-		t.Fatalf("active dashboard history row was not marked live: %#v", rows)
+	called = false
+	request = httptest.NewRequest(http.MethodGet, "/audit/", nil)
+	recorder = httptest.NewRecorder()
+	gateway.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized || called {
+		t.Fatalf("unauthenticated audit request crossed boundary: status=%d called=%v", recorder.Code, called)
 	}
 }
 

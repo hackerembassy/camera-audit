@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>History · Camera access audit</title>
+<link rel="stylesheet" href="/audit/assets/audit.css"><script defer src="/audit/assets/common.js"></script><script defer src="/audit/assets/history.js"></script>
+</head><body>
+<header class="topbar"><div class="shell topbar-inner"><a class="brand" href="/audit/">Camera access audit</a><nav class="primary-nav" aria-label="Audit pages"><a href="/audit/">Overview</a><a href="/audit/history" aria-current="page">History</a><a href="/audit/api/v1/history">JSON/API</a></nav></div></header>
+<div class="section-bar"><nav class="shell section-nav" aria-label="History sections"><a href="#frigate">Frigate activity</a><a href="#recordings">Recordings</a><a href="#streams">Streams</a></nav></div>
+<main class="shell">
+<div class="page-header"><div><h1>Activity history</h1><p class="meta">Displayed timezone: <strong id="timezone">loading</strong> · <span id="update-state" aria-live="polite">loading</span></p></div><div class="actions"><button id="refresh-button" class="button" type="button">Refresh now</button><a class="button" href="/audit/export.csv">Export CSV</a></div></div>
+<section id="frigate"><h2>Frigate and viewer activity</h2><p class="meta section-copy"><a href="/audit/api/v1/history?type=frigate">Raw JSON</a></p><div class="table-wrap"><table><thead><tr><th>Last seen</th><th>Started</th><th>Kind</th><th>Camera</th><th>Actor</th><th>Details</th><th>Expected</th></tr></thead><tbody id="event-rows"></tbody></table></div></section>
+<section id="recordings"><h2>Recording activity</h2><p class="meta section-copy"><a href="/audit/api/v1/history?type=recordings">Raw JSON</a></p><div class="table-wrap"><table><thead><tr><th>Last seen</th><th>Started</th><th>Kind</th><th>Camera</th><th>Actor</th><th>Protocol</th><th>Details</th></tr></thead><tbody id="recording-rows"></tbody></table></div></section>
+<section id="streams"><h2>go2rtc session history</h2><p class="meta section-copy"><a href="/audit/api/v1/history?type=streams">Raw JSON</a></p><div class="table-wrap"><table><thead><tr><th>State / last seen</th><th>Started</th><th>Camera</th><th>Actor</th><th>Protocol</th><th>User agent</th><th>Expected</th></tr></thead><tbody id="stream-rows"></tbody></table></div></section>
+<p class="footer-links"><a href="/audit/api/v1/history">All history JSON</a> · <a href="/audit/api/v1/history/dashboard">Display-ready history JSON</a></p>
+</main></body></html>

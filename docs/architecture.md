@@ -28,16 +28,15 @@ browser / Home Assistant
   Authentik proxy ---- trusted identity headers
           |
           v
-  gateway package ---- route audit + /audit API ---- SQLite
-          |                         ^
-          v                         |
-       Frigate                 audit manager <---- go2rtc polling
-                                      |
-                                      v
-                               MQTT publisher
-                                      |
-                                      v
-                               Home Assistant
+  gateway package ---- route audit ---- audit manager <---- go2rtc polling
+          |                  |               |
+          v                  v               v
+       Frigate          auditweb API      SQLite
+                              |
+                              v
+                       browser dashboard
+
+  audit manager ---- MQTT publisher ---- Home Assistant
 ```
 
 ## Package map
@@ -46,18 +45,21 @@ browser / Home Assistant
 | --- | --- |
 | `cmd/camera-audit` | Process assembly, signal handling, and graceful shutdown. |
 | `internal/config` | YAML defaults, environment expansion, and validation. |
-| `internal/gateway` | Authentik trust boundary, Frigate reverse proxy, route recognition, WebSocket relay, dashboard, JSON API, and CSV export. |
+| `internal/gateway` | Authentik trust boundary, Frigate reverse proxy, route recognition, WebSocket relay, health endpoints, and audit-web authentication. |
+| `internal/auditweb` | Authenticated `/audit` HTTP routes, JSON API, CSV export, dashboard projections, and embedded browser UI. |
 | `internal/go2rtc` | Bounded, authenticated reads of `/api/streams` and the diagnostic DOT graph. |
 | `internal/audit` | In-memory reconciliation, identity classification/correlation, leases, Birdseye layout, privacy state, and retention scheduling. |
 | `internal/telegram` | Immediate, incrementally edited Telegram summaries for recording playback, exports, and downloads. |
 | `internal/store` | SQLite schema, lifecycle writes, history queries, startup recovery, and pruning. |
 | `internal/mqttpub` | MQTT discovery, retained state, availability, reconnect recovery, and shutdown cleanup. |
-| `internal/model` | Data transferred between the manager, store, gateway, and JSON clients. |
+| `internal/model` | Data transferred between the manager, store, gateway, audit web handler, and JSON clients. |
 | `home-assistant` | Blueprint consuming the discovered privacy sensors. |
 
 The dependency direction is deliberately simple: the command wires concrete
-packages together; the gateway and MQTT publisher call the manager; the manager
-owns the go2rtc client and store. There is no global runtime state.
+packages together; the gateway enforces the trust boundary before delegating
+`/audit` requests to `auditweb`; the gateway, audit web handler, and MQTT
+publisher call the manager; the manager owns the go2rtc client and store. There
+is no global runtime state.
 
 ## Request and session flows
 
@@ -99,7 +101,7 @@ Every successful inventory updates the active session's exact in-memory
 transaction every five minutes. A disconnect, reused connection ID, outage
 boundary, or graceful shutdown writes the final observed time immediately;
 `ended_at` records when disappearance was detected and may therefore be later.
-The dashboard overlays active history rows with the in-memory value between
+The history page overlays active history rows with the in-memory value between
 checkpoints and labels those history rows `live` instead of presenting a moving
 last-seen timestamp.
 
@@ -110,9 +112,13 @@ this freshness flag; `/healthz` only reports that the process is serving.
 
 The diagnostic DOT graph is refreshed by an independent loop. A missing or slow
 graph endpoint therefore cannot delay consumer reconciliation or privacy state.
-The dashboard renders the sanitized DOT using the same vis-network parser and
+The overview page renders the sanitized DOT using the same vis-network parser and
 position-preserving update strategy as go2rtc's `net.html`; raw DOT remains
-available for diagnostics.
+available for diagnostics. The overview refreshes its memory-only payload every
+five seconds without querying history. The history page queries the three
+history categories on load, on demand, and every 30 seconds while visible. The
+HTML, CSS, and JavaScript are embedded by `internal/auditweb` so the deployed
+binary remains self-contained.
 
 ### Identity and suppression
 
@@ -209,16 +215,21 @@ to defaults.
 | --- | --- | --- |
 | `/healthz` | none | Process liveness. |
 | `/readyz` | none | SQLite reachable and go2rtc state fresh. |
-| `/audit/` | trusted proxy plus identity | Auto-updating dashboard shell. |
+| `/audit/` | trusted proxy plus identity | Live overview with sticky section navigation. |
+| `/audit/history` | trusted proxy plus identity | Frigate, recording, and go2rtc history page. |
 | `/audit/api/v1/current` | trusted proxy plus identity | Current sessions, activity, privacy, Birdseye, and freshness. |
-| `/audit/api/v1/dashboard` | trusted proxy plus identity | Combined live state and separated dashboard histories. |
+| `/audit/api/v1/live` | trusted proxy plus identity | Display-ready live state; performs no history queries. |
+| `/audit/api/v1/dashboard` | trusted proxy plus identity | Compatibility endpoint combining display-ready live and history data. |
 | `/audit/api/v1/history` | trusted proxy plus identity | Recent events; accepts `limit`, `camera`, and `type=frigate\|recordings\|streams`. |
+| `/audit/api/v1/history/dashboard` | trusted proxy plus identity | Display-ready, categorized history used by the history page. |
 | `/audit/api/v1/graph` | trusted proxy plus identity | Credential-sanitized go2rtc DOT source used by the dashboard graph. |
 | `/audit/export.csv` | trusted proxy plus identity | Up to 1,000 recent events, optionally filtered by `camera`. |
 | all other routes | forwarded to Frigate | Proxied and audited when recognized. |
 
-Dashboard and CSV timestamps use the configured timezone. JSON and SQLite stay
-in UTC.
+Display-ready API data and CSV timestamps use the configured timezone. Raw
+current/history JSON and SQLite stay in UTC. `gateway` authenticates every
+`/audit` request before dispatching it to `auditweb`; it also wraps CSV responses
+with the `audit_export_download` event.
 
 ## Safety and privacy invariants
 
