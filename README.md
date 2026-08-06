@@ -33,11 +33,12 @@ Frigate browser requests passing through Authentik have an exact username. WebRT
 
    Set the same values in `CAMERA_AUDIT_GO2RTC_USERNAME` and `CAMERA_AUDIT_GO2RTC_PASSWORD`. The daemon authenticates both `/api/streams` and `/api/streams.dot`; credentials are not stored in SQLite or emitted in logs. Leave go2rtc's `local_auth` at its default `false` for bundled Frigate: Frigate's own health check and nginx proxy call go2rtc over loopback without credentials, while a separate audit container is still authenticated because it is not a loopback client.
 4. Change the Authentik proxy provider upstream from Frigate to `http://camera-audit:8080`.
-5. Ensure Authentik sends `X-authentik-username`, and set `trusted_proxies` to the actual outpost/proxy CIDR. Requests from other networks cannot use identity headers or access `/audit/`.
-6. Configure Frigate proxy authentication as before. The gateway preserves the Authentik headers while forwarding to port 8971.
-7. Point the Home Assistant Frigate integration at the audit gateway if its HTTP snapshot and WebRTC signaling accesses must be observed. Its RTSP sessions on port 8554 are still discovered through go2rtc.
-8. Keep Frigate ports 5000, 8971, and go2rtc port 1984 off the host network. Port 1984 must be reachable from the audit container, but should not be published to an untrusted LAN because the go2rtc API is powerful. Restrict RTSP 8554 to known service networks; expose WebRTC 8555 only where required.
-9. Import `home-assistant/privacy-alert-blueprint.yaml`, select each camera's discovered binary sensor, and configure the speaker/light/notification action for its room.
+5. Ensure Authentik sends both username and group/role headers, and set `trusted_proxies` to the actual outpost/proxy CIDR. Requests from other networks cannot use identity headers or access `/audit/`. Configure Frigate's `proxy.header_map`, `role_map`, and separator to translate those headers into `remote-user` and `remote-role`.
+6. Set `frigate_url: https://frigate:8971` when Frigate's default TLS is enabled. Port 8971 is required for Frigate to enforce admin, viewer, and camera-limited custom roles; port 5000 deliberately ignores those roles and grants anonymous admin-equivalent access. For Frigate's generated self-signed certificate, explicitly enable `frigate_tls_insecure_skip_verify` only on the private Docker network. Prefer a valid certificate, optionally using `frigate_tls_ca_file` and `frigate_tls_server_name`.
+7. Set `proxy.auth_secret` in Frigate and provide the same value as `CAMERA_AUDIT_FRIGATE_PROXY_SECRET` so Frigate accepts mapped identity headers only from this gateway.
+8. Point the Home Assistant Frigate integration at the audit gateway if its HTTP snapshot and WebRTC signaling accesses must be observed. Its RTSP sessions on port 8554 are still discovered through go2rtc.
+9. Keep Frigate ports 5000, 8971, and go2rtc port 1984 off the host network. Port 1984 must be reachable from the audit container, but should not be published to an untrusted LAN because the go2rtc API is powerful. Restrict RTSP 8554 to known service networks; expose WebRTC 8555 only where required.
+10. Import `home-assistant/privacy-alert-blueprint.yaml`, select each camera's discovered binary sensor, and configure the speaker/light/notification action for its room.
 
 The dashboard is at `/audit/`. Any user authenticated by Authentik can see current consumers and history. Health endpoints are `/healthz` and `/readyz`.
 

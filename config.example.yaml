@@ -1,7 +1,20 @@
 listen: ":8080"
 
-# Authentik sends users here. The daemon forwards non-/audit paths to Frigate.
-frigate_url: "http://frigate:8971"
+# Authentik sends users to this daemon. It forwards non-/audit paths to
+# Frigate's authenticated port so Frigate enforces admin/viewer/custom roles.
+frigate_url: "https://frigate:8971"
+
+# Frigate's default generated certificate is self-signed and cannot be
+# hostname-verified. This explicit exception is suitable only on the private
+# Docker network. Prefer a valid certificate and set this to false.
+frigate_tls_insecure_skip_verify: true
+# With a verifiable private/public certificate instead use, as needed:
+# frigate_tls_ca_file: "/config/frigate-ca.crt"
+# frigate_tls_server_name: "frigate.example.org"
+
+# Optional but recommended: set the same value as Frigate proxy.auth_secret.
+# The daemon overwrites this header on both HTTP and WebSocket upstream calls.
+frigate_proxy_secret: "${CAMERA_AUDIT_FRIGATE_PROXY_SECRET}"
 
 # Direct base URL of Frigate's bundled go2rtc server. The daemon adds
 # /api/streams and /api/streams.dot. Port 1984 should be reachable only on the
@@ -40,6 +53,22 @@ rules:
     actor: "Frigate"
     actor_type: service
     suppressed: true
+
+  # To prevent User-Agent spoofing for Frigate:
+  # - name: frigate-internal-ipv4
+  #   stream: "*"
+  #   remote_cidr: "127.0.0.0/8"
+  #   user_agent: "(?i)(FFmpeg Frigate|frigate/ffmpeg)"
+  #   actor: "Frigate"
+  #   actor_type: service
+  #   suppressed: true
+  # - name: frigate-internal-ipv6
+  #   stream: "*"
+  #   remote_cidr: "::1/128"
+  #   user_agent: "(?i)(FFmpeg Frigate|frigate/ffmpeg)"
+  #   actor: "Frigate"
+  #   actor_type: service
+  #   suppressed: true
 
   # Replace this documentation address with the snapshotter's actual address.
   # - name: safe-unlocked-snapshotter

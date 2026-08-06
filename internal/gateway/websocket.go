@@ -33,10 +33,14 @@ func isFrigateControlWebSocket(r *http.Request) bool {
 func (g *Gateway) serveFrigateControlWebSocket(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := g.webSocketTarget(r.URL)
 	headers := webSocketRequestHeaders(r)
+	if g.cfg.FrigateProxySecret != "" {
+		headers.Set("X-Proxy-Secret", g.cfg.FrigateProxySecret)
+	}
 
 	dialer := *websocket.DefaultDialer
 	dialer.EnableCompression = true
 	dialer.Subprotocols = websocket.Subprotocols(r)
+	dialer.TLSClientConfig = g.tls.Clone()
 	upstream, response, err := dialer.DialContext(r.Context(), upstreamURL.String(), headers)
 	if err != nil {
 		g.writeWebSocketUpstreamError(w, response, err)

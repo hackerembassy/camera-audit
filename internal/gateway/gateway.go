@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +31,7 @@ type Gateway struct {
 	store   *store.Store
 	proxy   *httputil.ReverseProxy
 	target  *url.URL
+	tls     *tls.Config
 	trusted []netip.Prefix
 	log     *slog.Logger
 }
@@ -37,12 +41,24 @@ func New(cfg config.Config, manager *audit.Manager, store *store.Store, log *slo
 	if err != nil {
 		return nil, err
 	}
+	transport, tlsConfig, err := frigateTransport(cfg)
+	if err != nil {
+		return nil, err
+	}
 	p := httputil.NewSingleHostReverseProxy(target)
+	p.Transport = transport
+	director := p.Director
+	p.Director = func(r *http.Request) {
+		director(r)
+		if cfg.FrigateProxySecret != "" {
+			r.Header.Set("X-Proxy-Secret", cfg.FrigateProxySecret)
+		}
+	}
 	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Error("Frigate proxy", "error", err, "path", r.URL.Path)
 		http.Error(w, "Frigate upstream unavailable", http.StatusBadGateway)
 	}
-	g := &Gateway{cfg: cfg, manager: manager, store: store, proxy: p, target: target, log: log}
+	g := &Gateway{cfg: cfg, manager: manager, store: store, proxy: p, target: target, tls: tlsConfig, log: log}
 	for _, raw := range cfg.TrustedProxies {
 		prefix, _ := netip.ParsePrefix(raw)
 		g.trusted = append(g.trusted, prefix)
@@ -50,7 +66,34 @@ func New(cfg config.Config, manager *audit.Manager, store *store.Store, log *slo
 	return g, nil
 }
 
+func frigateTransport(cfg config.Config) (*http.Transport, *tls.Config, error) {
+	tlsConfig := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		ServerName:         cfg.FrigateTLSServerName,
+		InsecureSkipVerify: cfg.FrigateTLSInsecureSkipVerify, // Explicit opt-in for Frigate's generated self-signed certificate.
+	}
+	if cfg.FrigateTLSCAFile != "" {
+		certificate, err := os.ReadFile(cfg.FrigateTLSCAFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read Frigate TLS CA: %w", err)
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(certificate) {
+			return nil, nil, fmt.Errorf("read Frigate TLS CA: no certificates found")
+		}
+		tlsConfig.RootCAs = roots
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
+	return transport, tlsConfig, nil
+}
+
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// This credential belongs to the daemon, never to the browser or Authentik.
+	r.Header.Del("X-Proxy-Secret")
 	identity, trusted := g.identity(r)
 	if !trusted {
 		stripProxyIdentity(r.Header, g.cfg.IdentityHeader)

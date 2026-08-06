@@ -46,22 +46,26 @@ type MQTT struct {
 }
 
 type Config struct {
-	Listen            string   `yaml:"listen"`
-	FrigateURL        string   `yaml:"frigate_url"`
-	Go2RTCURL         string   `yaml:"go2rtc_url"`
-	Go2RTCUsername    string   `yaml:"go2rtc_username"`
-	Go2RTCPassword    string   `yaml:"go2rtc_password"`
-	Database          string   `yaml:"database"`
-	IdentityHeader    string   `yaml:"identity_header"`
-	TrustedProxies    []string `yaml:"trusted_proxies"`
-	PollInterval      Duration `yaml:"poll_interval"`
-	ActivityWindow    Duration `yaml:"activity_window"`
-	SnapshotLease     Duration `yaml:"snapshot_lease"`
-	PrivacyClearDelay Duration `yaml:"privacy_clear_delay"`
-	Retention         Duration `yaml:"retention"`
-	BirdseyeCameras   []string `yaml:"birdseye_cameras"`
-	Rules             []Rule   `yaml:"rules"`
-	MQTT              MQTT     `yaml:"mqtt"`
+	Listen                       string   `yaml:"listen"`
+	FrigateURL                   string   `yaml:"frigate_url"`
+	FrigateTLSCAFile             string   `yaml:"frigate_tls_ca_file"`
+	FrigateTLSServerName         string   `yaml:"frigate_tls_server_name"`
+	FrigateTLSInsecureSkipVerify bool     `yaml:"frigate_tls_insecure_skip_verify"`
+	FrigateProxySecret           string   `yaml:"frigate_proxy_secret"`
+	Go2RTCURL                    string   `yaml:"go2rtc_url"`
+	Go2RTCUsername               string   `yaml:"go2rtc_username"`
+	Go2RTCPassword               string   `yaml:"go2rtc_password"`
+	Database                     string   `yaml:"database"`
+	IdentityHeader               string   `yaml:"identity_header"`
+	TrustedProxies               []string `yaml:"trusted_proxies"`
+	PollInterval                 Duration `yaml:"poll_interval"`
+	ActivityWindow               Duration `yaml:"activity_window"`
+	SnapshotLease                Duration `yaml:"snapshot_lease"`
+	PrivacyClearDelay            Duration `yaml:"privacy_clear_delay"`
+	Retention                    Duration `yaml:"retention"`
+	BirdseyeCameras              []string `yaml:"birdseye_cameras"`
+	Rules                        []Rule   `yaml:"rules"`
+	MQTT                         MQTT     `yaml:"mqtt"`
 }
 
 func Load(path string) (Config, error) {
@@ -92,6 +96,9 @@ func Load(path string) (Config, error) {
 	}
 	if (c.Go2RTCUsername == "") != (c.Go2RTCPassword == "") {
 		return Config{}, fmt.Errorf("go2rtc_username and go2rtc_password must either both be set or both be empty")
+	}
+	if c.FrigateTLSCAFile != "" && c.FrigateTLSInsecureSkipVerify {
+		return Config{}, fmt.Errorf("frigate_tls_ca_file and frigate_tls_insecure_skip_verify cannot be used together")
 	}
 	if len(c.TrustedProxies) == 0 {
 		return Config{}, fmt.Errorf("trusted_proxies must contain the Authentik proxy network")

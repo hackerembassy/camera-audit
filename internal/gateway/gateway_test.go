@@ -1,10 +1,13 @@
 package gateway
 
 import (
+	"encoding/pem"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -95,9 +98,13 @@ func TestParseBirdseyeLayout(t *testing.T) {
 func TestFrigateControlWebSocketRelayObservesLayout(t *testing.T) {
 	const layoutMessage = `{"topic":"birdseye_layout","payload":"{\"workshop\":{\"x\":0},\"hall\":{\"x\":100}}"}`
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/ws" {
 			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("X-Proxy-Secret") != "gateway-secret" {
+			http.Error(w, "missing proxy secret", http.StatusUnauthorized)
 			return
 		}
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -121,7 +128,11 @@ func TestFrigateControlWebSocketRelayObservesLayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gateway, err := New(config.Config{FrigateURL: upstream.URL}, manager, nil, log)
+	gateway, err := New(config.Config{
+		FrigateURL:                   upstream.URL,
+		FrigateTLSInsecureSkipVerify: true,
+		FrigateProxySecret:           "gateway-secret",
+	}, manager, nil, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,5 +175,47 @@ func TestFrigateControlWebSocketRelayObservesLayout(t *testing.T) {
 	}
 	if messageType != websocket.BinaryMessage || string(echoed) != string(payload) {
 		t.Fatalf("binary message changed in transit: type=%d payload=%v", messageType, echoed)
+	}
+}
+
+func TestFrigateTLSCAAndProxySecret(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Proxy-Secret") != "gateway-secret" {
+			http.Error(w, "missing proxy secret", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	caFile := filepath.Join(t.TempDir(), "frigate-ca.pem")
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: upstream.Certificate().Raw})
+	if err := os.WriteFile(caFile, certificate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	gateway, err := New(config.Config{
+		FrigateURL:         upstream.URL,
+		FrigateTLSCAFile:   caFile,
+		FrigateProxySecret: "gateway-secret",
+	}, nil, nil, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(gateway)
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/version", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Proxy-Secret", "browser-supplied-secret")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%s", response.Status)
 	}
 }
