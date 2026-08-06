@@ -63,7 +63,16 @@ For each observed camera, MQTT Discovery creates an occupancy-class binary senso
 
 Viewer states are retained so Home Assistant recovers promptly after its own restart. On every daemon MQTT connection, `camera-audit` subscribes to `<topic_prefix>/+/viewer`, clears retained `ON` values that are not active in the current process, and then republishes current state. A graceful shutdown also publishes `OFF` for every known camera before marking the device offline. The MQTT account therefore needs subscribe permission for `<topic_prefix>/+/viewer` in addition to its existing publish permissions. A genuinely active viewer may briefly transition through `OFF` during a full daemon restart and is restored to `ON` by the first go2rtc poll.
 
+Camera topic and discovery IDs combine a readable slug with a stable hash, so
+names that slug identically (or contain only non-ASCII characters) remain
+distinct. On upgrade, the daemon removes retained discovery entries created by
+the older plain-slug format. If the broker is unavailable at startup, auditing
+and proxying still start while the MQTT client reconnects in the background.
+
 ## Local development
+
+For a maintainer-oriented tour of the packages, request flows, state machines,
+storage model, and extension points, see [Codebase architecture](docs/architecture.md).
 
 ```sh
 go test ./...

@@ -103,9 +103,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del("X-Proxy-Secret")
 	identity, trusted := g.identity(r)
 	if !trusted {
+		// Both identity and client-address headers share the same trust boundary.
+		// Removing them also prevents an untrusted caller spoofing Frigate roles.
 		stripProxyIdentity(r.Header, g.cfg.IdentityHeader)
 	}
-	if strings.HasPrefix(r.URL.Path, "/audit") || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+	if isAuditPath(r.URL.Path) || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 		if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && (!trusted || identity == "") {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
@@ -144,6 +146,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if eventID != 0 {
 		g.manager.EndHTTP(context.Background(), eventID, time.Now().UTC())
 	}
+}
+
+func isAuditPath(requestPath string) bool {
+	return requestPath == "/audit" || strings.HasPrefix(requestPath, "/audit/")
 }
 
 func stripProxyIdentity(h http.Header, configured string) {
@@ -280,7 +286,8 @@ func (g *Gateway) serveAudit(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 		defer cancel()
 		if err := g.store.Ping(ctx); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			g.log.Warn("readiness database check", "error", err)
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		if !g.manager.Current().Fresh {
@@ -304,7 +311,11 @@ func (g *Gateway) serveAudit(w http.ResponseWriter, r *http.Request) {
 	case "/audit/export.csv":
 		g.exportCSV(w, r)
 	default:
-		g.dashboard(w, r)
+		if r.URL.Path == "/audit" || r.URL.Path == "/audit/" {
+			g.dashboard(w, r)
+			return
+		}
+		http.NotFound(w, r)
 	}
 }
 
@@ -340,7 +351,7 @@ func (g *Gateway) csvTime(value time.Time) string {
 	return value.In(g.location).Format(time.RFC3339)
 }
 
-const dashboardTimeLayout = "2006-01-02 15:04:05 MST -07:00"
+const dashboardTimeLayout = "2006-01-02 15:04:05 -07:00"
 
 func (g *Gateway) dashboardTime(value time.Time) string {
 	if value.IsZero() {

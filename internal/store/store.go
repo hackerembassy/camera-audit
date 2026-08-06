@@ -18,6 +18,8 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The workload is small and write-heavy. One connection gives SQLite
+	// deterministic write ordering while WAL still permits efficient reads.
 	db.SetMaxOpenConns(1)
 	if _, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;`); err != nil {
 		db.Close()
@@ -86,6 +88,8 @@ CREATE INDEX IF NOT EXISTS events_camera_last_seen_idx ON events(camera,last_see
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) RecoverOpen(ctx context.Context, at time.Time) error {
+	// Live truth is rebuilt from go2rtc and new gateway traffic. Carrying an
+	// open interval across a process gap would claim continuity we did not see.
 	now := at.UTC().Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(ctx, `UPDATE events SET ended_at=?,last_seen_at=?,details=CASE WHEN details='' THEN 'closed after daemon restart' ELSE details END WHERE ended_at IS NULL`, now, now)
 	return err

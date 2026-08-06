@@ -1,6 +1,7 @@
 package mqttpub
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -35,6 +36,8 @@ func New(cfg config.MQTT, log *slog.Logger) (*Publisher, error) {
 	opts.SetWill(cfg.TopicPrefix+"/availability", "offline", 1, true)
 	opts.OnConnect = func(c mqtt.Client) {
 		p.subscribeRetainedStateCleanup(c)
+		// The callback can race with Manager.Set. Snapshot under the lock, then
+		// publish without holding it because broker I/O may block.
 		p.mu.Lock()
 		available := p.available
 		states := make(map[string]bool, len(p.states))
@@ -52,7 +55,10 @@ func New(cfg config.MQTT, log *slog.Logger) (*Publisher, error) {
 	p.client = mqtt.NewClient(opts)
 	token := p.client.Connect()
 	if !token.WaitTimeout(15 * time.Second) {
-		return nil, fmt.Errorf("MQTT connection timed out")
+		// ConnectRetry keeps working in the background. Auditing and proxying do
+		// not need to be unavailable merely because the notification path is down.
+		log.Warn("initial MQTT connection timed out; retrying in background")
+		return p, nil
 	}
 	if token.Error() != nil {
 		return nil, token.Error()
@@ -147,6 +153,15 @@ func slug(s string) string {
 	return strings.Trim(nonSlug.ReplaceAllString(s, "_"), "_")
 }
 
+func cameraID(camera string) string {
+	base := slug(camera)
+	if base == "" {
+		base = "camera"
+	}
+	digest := sha256.Sum256([]byte(camera))
+	return fmt.Sprintf("%s_%x", base, digest[:4])
+}
+
 func state(active bool) string {
 	if active {
 		return "ON"
@@ -162,24 +177,33 @@ func availability(available bool) string {
 }
 
 func (p *Publisher) stateTopic(camera string) string {
-	return p.cfg.TopicPrefix + "/" + slug(camera) + "/viewer"
+	return p.cfg.TopicPrefix + "/" + cameraID(camera) + "/viewer"
 }
 
 func (p *Publisher) publishDiscovery(c mqtt.Client, camera string) {
-	id := p.cfg.ClientID + "_" + slug(camera) + "_viewer"
+	objectID := cameraID(camera)
+	id := p.cfg.ClientID + "_" + objectID + "_viewer"
 	payload, _ := json.Marshal(map[string]any{
 		"name": camera + " external viewer active", "unique_id": id,
 		"state_topic": p.stateTopic(camera), "availability_topic": p.cfg.TopicPrefix + "/availability",
 		"payload_on": "ON", "payload_off": "OFF", "device_class": "occupancy",
 		"device": map[string]any{"identifiers": []string{p.cfg.ClientID}, "name": "Camera access audit"},
 	})
-	topic := fmt.Sprintf("%s/binary_sensor/%s/%s/config", p.cfg.DiscoveryPrefix, p.cfg.ClientID, slug(camera))
+	// Remove discovery retained by versions that used the collision-prone plain
+	// slug. An empty retained payload is MQTT Discovery's deletion mechanism.
+	legacyTopic := fmt.Sprintf("%s/binary_sensor/%s/%s/config", p.cfg.DiscoveryPrefix, p.cfg.ClientID, slug(camera))
+	p.publish(c, legacyTopic, "", true)
+	topic := fmt.Sprintf("%s/binary_sensor/%s/%s/config", p.cfg.DiscoveryPrefix, p.cfg.ClientID, objectID)
 	p.publish(c, topic, string(payload), true)
 }
 
 func (p *Publisher) publish(c mqtt.Client, topic, payload string, retained bool) {
 	t := c.Publish(topic, 1, retained, payload)
-	if t.WaitTimeout(5*time.Second) && t.Error() != nil {
+	if !t.WaitTimeout(5 * time.Second) {
+		p.log.Warn("publish MQTT timed out", "topic", topic)
+		return
+	}
+	if t.Error() != nil {
 		p.log.Warn("publish MQTT", "topic", topic, "error", t.Error())
 	}
 }

@@ -43,6 +43,11 @@ type activityLease struct {
 	expires    time.Time
 }
 
+type birdseyeControl struct {
+	layout map[string]struct{}
+	order  uint64
+}
+
 type PrivacyObserver func(camera string, active bool)
 type AvailabilityObserver func(available bool)
 
@@ -62,9 +67,9 @@ type Manager struct {
 	signals              []signal
 	privacy              map[string]bool
 	zeroSince            map[string]time.Time
-	birdseyeLayout       map[string]struct{}
-	birdseyeControlConns map[uint64]bool
+	birdseyeControlConns map[uint64]birdseyeControl
 	nextBirdseyeControl  uint64
+	nextBirdseyeLayout   uint64
 	lastPoll             time.Time
 	fresh                bool
 	dot                  string
@@ -78,7 +83,7 @@ func New(cfg config.Config, s *store.Store, log *slog.Logger) (*Manager, error) 
 		sessions: make(map[string]*model.ActiveSession), activities: make(map[string]model.Activity),
 		liveHTTP: make(map[int64]liveHTTP), leases: make(map[string]activityLease),
 		privacy: make(map[string]bool), zeroSince: make(map[string]time.Time),
-		birdseyeControlConns: make(map[uint64]bool),
+		birdseyeControlConns: make(map[uint64]birdseyeControl),
 	}
 	for _, r := range cfg.Rules {
 		cr := compiledRule{Rule: r}
@@ -94,8 +99,17 @@ func New(cfg config.Config, s *store.Store, log *slog.Logger) (*Manager, error) 
 	return m, nil
 }
 
-func (m *Manager) SetObserver(fn PrivacyObserver)                  { m.observer = fn }
-func (m *Manager) SetAvailabilityObserver(fn AvailabilityObserver) { m.availabilityObserver = fn }
+func (m *Manager) SetObserver(fn PrivacyObserver) {
+	m.mu.Lock()
+	m.observer = fn
+	m.mu.Unlock()
+}
+
+func (m *Manager) SetAvailabilityObserver(fn AvailabilityObserver) {
+	m.mu.Lock()
+	m.availabilityObserver = fn
+	m.mu.Unlock()
+}
 
 // BirdseyeControlOpened marks a proxied Frigate control WebSocket as active.
 // A layout learned while at least one control socket is active takes priority
@@ -105,9 +119,9 @@ func (m *Manager) BirdseyeControlOpened() uint64 {
 	m.nextBirdseyeControl++
 	id := m.nextBirdseyeControl
 	if m.birdseyeControlConns == nil {
-		m.birdseyeControlConns = make(map[uint64]bool)
+		m.birdseyeControlConns = make(map[uint64]birdseyeControl)
 	}
-	m.birdseyeControlConns[id] = false
+	m.birdseyeControlConns[id] = birdseyeControl{}
 	m.mu.Unlock()
 	return id
 }
@@ -115,9 +129,6 @@ func (m *Manager) BirdseyeControlOpened() uint64 {
 func (m *Manager) BirdseyeControlClosed(id uint64) {
 	m.mu.Lock()
 	delete(m.birdseyeControlConns, id)
-	if !m.hasBirdseyeLayoutSocketLocked() {
-		m.birdseyeLayout = nil
-	}
 	m.mu.Unlock()
 }
 
@@ -136,8 +147,8 @@ func (m *Manager) UpdateBirdseyeLayout(connectionID uint64, cameras []string) {
 		m.mu.Unlock()
 		return
 	}
-	m.birdseyeControlConns[connectionID] = true
-	m.birdseyeLayout = layout
+	m.nextBirdseyeLayout++
+	m.birdseyeControlConns[connectionID] = birdseyeControl{layout: layout, order: m.nextBirdseyeLayout}
 	m.mu.Unlock()
 }
 
@@ -145,9 +156,15 @@ func (m *Manager) Run(ctx context.Context) {
 	poll := time.NewTicker(m.cfg.PollInterval.Value())
 	state := time.NewTicker(time.Second)
 	prune := time.NewTicker(24 * time.Hour)
+	dotDone := make(chan struct{})
+	go func() {
+		defer close(dotDone)
+		m.runDOT(ctx)
+	}()
 	defer poll.Stop()
 	defer state.Stop()
 	defer prune.Stop()
+	defer func() { <-dotDone }()
 	defer m.closeTracked()
 	m.poll(ctx)
 	for {
@@ -181,35 +198,36 @@ func (m *Manager) closeTracked() {
 	for _, lease := range m.leases {
 		_ = m.store.End(context.Background(), lease.eventID, now)
 	}
+	for eventID := range m.liveHTTP {
+		_ = m.store.End(context.Background(), eventID, now)
+	}
 }
 
 func (m *Manager) poll(ctx context.Context) {
 	streams, err := m.client.Streams(ctx)
 	if err != nil {
+		// Preserve the last inventory while go2rtc is unreachable. Ending it here
+		// would turn a transient polling failure into false disconnect history.
 		m.mu.Lock()
 		wasFresh := m.fresh
 		m.fresh = false
+		availabilityObserver := m.availabilityObserver
 		m.mu.Unlock()
-		if wasFresh && m.availabilityObserver != nil {
-			m.availabilityObserver(false)
+		if wasFresh && availabilityObserver != nil {
+			availabilityObserver(false)
 		}
 		m.log.Warn("poll go2rtc streams", "error", err)
 		return
 	}
-	dot, dotErr := m.client.SanitizedDOT(ctx)
 	now := time.Now().UTC()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	wasFresh := m.fresh
 	m.fresh = true
 	m.lastPoll = now
-	if dotErr == nil {
-		m.dot = dot
-	} else {
-		m.log.Debug("fetch go2rtc graph", "error", dotErr)
-	}
 	if !wasFresh {
+		// We cannot prove that a connection survived the observation gap. Close
+		// the old intervals and let this successful snapshot establish new ones.
 		for key, session := range m.sessions {
 			if err := m.store.End(ctx, session.EventID, now); err != nil {
 				m.log.Error("close pre-outage stream session", "error", err)
@@ -255,6 +273,8 @@ func (m *Manager) poll(ctx context.Context) {
 			continue
 		}
 		session.Misses++
+		// A consumer can disappear from one inventory snapshot during go2rtc
+		// churn. Require a second successful miss before ending its audit event.
 		if session.Misses < 2 {
 			continue
 		}
@@ -263,18 +283,38 @@ func (m *Manager) poll(ctx context.Context) {
 		}
 		delete(m.sessions, key)
 	}
-	cut := now.Add(-15 * time.Second)
-	i := 0
-	for _, s := range m.signals {
-		if s.at.After(cut) {
-			m.signals[i] = s
-			i++
+	m.pruneSignalsLocked(now)
+	availabilityObserver := m.availabilityObserver
+	m.mu.Unlock()
+	if !wasFresh && availabilityObserver != nil {
+		availabilityObserver(true)
+	}
+}
+
+func (m *Manager) runDOT(ctx context.Context) {
+	ticker := time.NewTicker(m.cfg.PollInterval.Value())
+	defer ticker.Stop()
+	for {
+		m.refreshDOT(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
-	m.signals = m.signals[:i]
-	if !wasFresh && m.availabilityObserver != nil {
-		go m.availabilityObserver(true)
+}
+
+func (m *Manager) refreshDOT(ctx context.Context) {
+	dot, err := m.client.SanitizedDOT(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			m.log.Debug("fetch go2rtc graph", "error", err)
+		}
+		return
 	}
+	m.mu.Lock()
+	m.dot = dot
+	m.mu.Unlock()
 }
 
 func (m *Manager) classify(camera, protocol, remote, ua string) (string, string, string, bool, string) {
@@ -314,13 +354,16 @@ func (m *Manager) classify(camera, protocol, remote, ua string) (string, string,
 }
 
 func (m *Manager) matchSignal(camera, remote, ua string, now time.Time) (signal, bool) {
+	// Search newest-first because repeated signaling for one camera is common.
+	// This is a correlation hint, not proof, hence the caller's confidence value.
 	host := hostOnly(remote)
 	for i := len(m.signals) - 1; i >= 0; i-- {
 		s := m.signals[i]
 		if s.camera != camera || now.Sub(s.at) > 15*time.Second {
 			continue
 		}
-		if s.actorType != "service" && s.remote != "" && host != "" && !strings.Contains(remote, s.remote) {
+		signalHost := hostOnly(s.remote)
+		if s.actorType != "service" && signalHost != "" && host != "" && host != signalHost {
 			continue
 		}
 		if s.actorType != "service" && s.userAgent != "" && ua != "" && s.userAgent != ua {
@@ -375,9 +418,22 @@ func (m *Manager) RecordActivity(ctx context.Context, actor, remote, ua string, 
 
 func (m *Manager) RecordSignal(camera, actor, actorType, confidence, remote, ua string, now time.Time) {
 	m.mu.Lock()
+	m.pruneSignalsLocked(now)
 	m.signals = append(m.signals, signal{camera: camera, actor: actor, actorType: actorType,
 		confidence: confidence, remote: remote, userAgent: ua, at: now.UTC()})
 	m.mu.Unlock()
+}
+
+func (m *Manager) pruneSignalsLocked(now time.Time) {
+	cut := now.UTC().Add(-15 * time.Second)
+	i := 0
+	for _, s := range m.signals {
+		if s.at.After(cut) {
+			m.signals[i] = s
+			i++
+		}
+	}
+	m.signals = m.signals[:i]
 }
 
 func (m *Manager) StartHTTP(ctx context.Context, kind, camera, details, actor, actorType, confidence, protocol, remote, ua string, now time.Time) int64 {
@@ -387,7 +443,12 @@ func (m *Manager) StartHTTP(ctx context.Context, kind, camera, details, actor, a
 	}
 	leaseDuration, leasePrivacy := m.httpLease(kind, protocol)
 	leaseKey := kind + "\x00" + camera + "\x00" + details + "\x00" + actor + "\x00" + remote + "\x00" + ua
+	e := model.Event{Kind: kind, Actor: actor, ActorType: actorType, Confidence: confidence, Camera: camera,
+		Protocol: protocol, RemoteAddr: remote, UserAgent: ua, Suppressed: suppressed, SuppressionRule: rule,
+		StartedAt: now.UTC(), Details: details}
 	if leaseDuration > 0 {
+		// Snapshots and playback arrive as many short requests. Renew one logical
+		// interval and return zero so ServeHTTP does not close it with the request.
 		m.mu.Lock()
 		if lease, ok := m.leases[leaseKey]; ok {
 			lease.expires = now.Add(leaseDuration)
@@ -398,22 +459,24 @@ func (m *Manager) StartHTTP(ctx context.Context, kind, camera, details, actor, a
 			}
 			return 0
 		}
+		// Keep the lookup and creation in one critical section so concurrent
+		// identical requests cannot create an unreachable duplicate event.
+		id, err := m.store.Start(ctx, e)
+		if err != nil {
+			m.mu.Unlock()
+			m.log.Error("persist HTTP camera access", "error", err)
+			return 0
+		}
+		m.leases[leaseKey] = activityLease{eventID: id, camera: camera, suppressed: suppressed, privacy: leasePrivacy, expires: now.Add(leaseDuration)}
 		m.mu.Unlock()
+		return 0
 	}
-	e := model.Event{Kind: kind, Actor: actor, ActorType: actorType, Confidence: confidence, Camera: camera,
-		Protocol: protocol, RemoteAddr: remote, UserAgent: ua, Suppressed: suppressed, SuppressionRule: rule,
-		StartedAt: now.UTC(), Details: details}
 	id, err := m.store.Start(ctx, e)
 	if err != nil {
 		m.log.Error("persist HTTP camera access", "error", err)
 		return 0
 	}
-	if leaseDuration > 0 {
-		m.mu.Lock()
-		m.leases[leaseKey] = activityLease{eventID: id, camera: camera, suppressed: suppressed, privacy: leasePrivacy, expires: now.Add(leaseDuration)}
-		m.mu.Unlock()
-		return 0
-	} else if kind == "webrtc_signal" {
+	if kind == "webrtc_signal" {
 		if err := m.store.End(ctx, id, now.UTC()); err != nil {
 			m.log.Error("persist WebRTC signal end", "error", err)
 		}
@@ -456,6 +519,7 @@ func (m *Manager) EndHTTP(ctx context.Context, id int64, now time.Time) {
 
 func (m *Manager) tick(now time.Time) {
 	m.mu.Lock()
+	m.pruneSignalsLocked(now)
 	for k, a := range m.activities {
 		if now.Sub(a.LastSeen) > m.cfg.ActivityWindow.Value() {
 			if a.EventID != 0 {
@@ -510,6 +574,7 @@ func (m *Manager) tick(now time.Time) {
 	for camera := range all {
 		current := m.privacy[camera]
 		if raw[camera] {
+			// Alert immediately on observation; only the OFF transition is delayed.
 			delete(m.zeroSince, camera)
 			if !current {
 				m.privacy[camera] = true
@@ -535,18 +600,27 @@ func (m *Manager) tick(now time.Time) {
 			}{camera, false})
 		}
 	}
+	observer := m.observer
 	m.mu.Unlock()
-	if m.observer != nil {
+	// Observers may perform network I/O, so never invoke them while holding the
+	// manager mutex used by HTTP handlers and the polling loop.
+	if observer != nil {
 		for _, c := range changes {
-			m.observer(c.camera, c.active)
+			observer(c.camera, c.active)
 		}
 	}
 }
 
 func (m *Manager) birdseyeTargetsLocked() []string {
-	if m.hasBirdseyeLayoutSocketLocked() {
-		cameras := make([]string, 0, len(m.birdseyeLayout))
-		for camera := range m.birdseyeLayout {
+	var latest birdseyeControl
+	for _, control := range m.birdseyeControlConns {
+		if control.order > latest.order {
+			latest = control
+		}
+	}
+	if latest.order != 0 {
+		cameras := make([]string, 0, len(latest.layout))
+		for camera := range latest.layout {
 			cameras = append(cameras, camera)
 		}
 		sort.Strings(cameras)
@@ -558,8 +632,8 @@ func (m *Manager) birdseyeTargetsLocked() []string {
 }
 
 func (m *Manager) hasBirdseyeLayoutSocketLocked() bool {
-	for _, suppliedLayout := range m.birdseyeControlConns {
-		if suppliedLayout {
+	for _, control := range m.birdseyeControlConns {
+		if control.order != 0 {
 			return true
 		}
 	}

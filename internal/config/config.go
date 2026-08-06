@@ -1,8 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -91,11 +93,19 @@ func Load(path string) (Config, error) {
 			DiscoveryPrefix: "homeassistant",
 		},
 	}
-	if err := yaml.Unmarshal(b, &c); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(b))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&c); err != nil {
 		return Config{}, err
 	}
 	if c.FrigateURL == "" || c.Go2RTCURL == "" || c.Database == "" {
 		return Config{}, fmt.Errorf("frigate_url, go2rtc_url, and database are required")
+	}
+	if err := validateHTTPURL("frigate_url", c.FrigateURL); err != nil {
+		return Config{}, err
+	}
+	if err := validateHTTPURL("go2rtc_url", c.Go2RTCURL); err != nil {
+		return Config{}, err
 	}
 	if (c.Go2RTCUsername == "") != (c.Go2RTCPassword == "") {
 		return Config{}, fmt.Errorf("go2rtc_username and go2rtc_password must either both be set or both be empty")
@@ -105,6 +115,17 @@ func Load(path string) (Config, error) {
 	}
 	if len(c.TrustedProxies) == 0 {
 		return Config{}, fmt.Errorf("trusted_proxies must contain the Authentik proxy network")
+	}
+	for name, duration := range map[string]Duration{
+		"poll_interval":       c.PollInterval,
+		"activity_window":     c.ActivityWindow,
+		"snapshot_lease":      c.SnapshotLease,
+		"privacy_clear_delay": c.PrivacyClearDelay,
+		"retention":           c.Retention,
+	} {
+		if duration.Value() <= 0 {
+			return Config{}, fmt.Errorf("%s must be greater than zero", name)
+		}
 	}
 	if _, err := c.Location(); err != nil {
 		return Config{}, err
@@ -130,7 +151,30 @@ func Load(path string) (Config, error) {
 		}
 	}
 	c.IdentityHeader = strings.TrimSpace(c.IdentityHeader)
+	if c.IdentityHeader == "" {
+		return Config{}, fmt.Errorf("identity_header must not be empty")
+	}
+	if c.MQTT.Enabled {
+		if strings.TrimSpace(c.MQTT.Broker) == "" || strings.TrimSpace(c.MQTT.ClientID) == "" ||
+			strings.TrimSpace(c.MQTT.TopicPrefix) == "" || strings.TrimSpace(c.MQTT.DiscoveryPrefix) == "" {
+			return Config{}, fmt.Errorf("enabled MQTT requires broker, client_id, topic_prefix, and discovery_prefix")
+		}
+	}
 	return c, nil
+}
+
+func validateHTTPURL(name, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("%s must be an absolute HTTP or HTTPS URL", name)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not contain credentials", name)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%s must not contain a query or fragment", name)
+	}
+	return nil
 }
 
 func (c Config) Location() (*time.Location, error) {

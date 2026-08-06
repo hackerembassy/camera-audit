@@ -161,6 +161,8 @@ func (g *Gateway) relayWebSocket(source, destination *websocket.Conn, birdseyeCo
 
 		var capture *boundedCapture
 		if birdseyeControlID != 0 && messageType == websocket.TextMessage {
+			// Relay every byte regardless of inspection. The bounded side copy keeps
+			// an unrelated or malicious control message from growing daemon memory.
 			capture = &boundedCapture{limit: maxInspectedWebSocketMessage}
 			reader = io.TeeReader(reader, capture)
 		}

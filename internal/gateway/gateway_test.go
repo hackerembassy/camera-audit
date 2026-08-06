@@ -59,7 +59,7 @@ func TestConfiguredTimezoneFormatsHumanAndCSVTimes(t *testing.T) {
 	if got, want := gateway.csvTime(value), "2026-08-06T11:30:00+04:00"; got != want {
 		t.Fatalf("csvTime=%q, want %q", got, want)
 	}
-	if got, want := gateway.dashboardTime(value), "2026-08-06 11:30:00 +04 +04:00"; got != want {
+	if got, want := gateway.dashboardTime(value), "2026-08-06 11:30:00 +04:00"; got != want {
 		t.Fatalf("dashboardTime=%q, want %q", got, want)
 	}
 	if got := gateway.dashboardTime(time.Time{}); got != "never" {
@@ -79,6 +79,23 @@ func TestStripProxyIdentity(t *testing.T) {
 	}
 	if h.Get("Authorization") == "" {
 		t.Fatal("service authorization must be preserved")
+	}
+}
+
+func TestAuditPathBoundaryAndUnknownRoute(t *testing.T) {
+	for requestPath, want := range map[string]bool{
+		"/audit": true, "/audit/": true, "/audit/api/v1/current": true,
+		"/auditor": false, "/audit-log": false,
+	} {
+		if got := isAuditPath(requestPath); got != want {
+			t.Errorf("isAuditPath(%q)=%v, want %v", requestPath, got, want)
+		}
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/audit/api/v1/unknown", nil)
+	(&Gateway{}).serveAudit(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown audit route status=%d, want %d", recorder.Code, http.StatusNotFound)
 	}
 }
 

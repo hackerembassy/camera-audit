@@ -23,16 +23,18 @@ func TestShouldClearStaleRetainedViewerState(t *testing.T) {
 			"hall":     true,
 		},
 	}
+	workshopTopic := p.stateTopic("workshop")
+	hallTopic := p.stateTopic("hall")
 	tests := []struct {
 		name           string
 		topic, payload string
 		retained, want bool
 	}{
 		{name: "unknown stale ON", topic: "camera_audit/old_camera/viewer", payload: "ON", retained: true, want: true},
-		{name: "known inactive ON", topic: "camera_audit/workshop/viewer", payload: "ON", retained: true, want: true},
-		{name: "known active ON", topic: "camera_audit/hall/viewer", payload: "ON", retained: true, want: false},
-		{name: "retained OFF", topic: "camera_audit/workshop/viewer", payload: "OFF", retained: true, want: false},
-		{name: "live ON", topic: "camera_audit/workshop/viewer", payload: "ON", retained: false, want: false},
+		{name: "known inactive ON", topic: workshopTopic, payload: "ON", retained: true, want: true},
+		{name: "known active ON", topic: hallTopic, payload: "ON", retained: true, want: false},
+		{name: "retained OFF", topic: workshopTopic, payload: "OFF", retained: true, want: false},
+		{name: "live ON", topic: workshopTopic, payload: "ON", retained: false, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -43,7 +45,7 @@ func TestShouldClearStaleRetainedViewerState(t *testing.T) {
 	}
 }
 
-func TestShouldNotClearSlugCollisionWithActiveCamera(t *testing.T) {
+func TestCameraTopicsDoNotCollideAfterSlugging(t *testing.T) {
 	p := &Publisher{
 		cfg: config.MQTT{TopicPrefix: "camera_audit"},
 		states: map[string]bool{
@@ -51,7 +53,18 @@ func TestShouldNotClearSlugCollisionWithActiveCamera(t *testing.T) {
 			"Camera-A": true,
 		},
 	}
-	if p.shouldClearRetained("camera_audit/camera_a/viewer", "ON", true) {
-		t.Fatal("active camera sharing the state topic was cleared")
+	inactiveTopic := p.stateTopic("Camera A")
+	activeTopic := p.stateTopic("Camera-A")
+	if inactiveTopic == activeTopic {
+		t.Fatalf("camera topics collide: %q", activeTopic)
+	}
+	if !p.shouldClearRetained(inactiveTopic, "ON", true) {
+		t.Fatal("inactive camera state was not cleared")
+	}
+	if p.shouldClearRetained(activeTopic, "ON", true) {
+		t.Fatal("active camera state was cleared")
+	}
+	if got := cameraID("Камера"); got == "" || got == cameraID("相机") {
+		t.Fatalf("non-ASCII camera IDs are not distinct: %q", got)
 	}
 }

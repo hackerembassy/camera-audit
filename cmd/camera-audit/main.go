@@ -18,6 +18,13 @@ import (
 )
 
 func main() {
+	exitCode := 0
+	// Registered first so resource-cleanup defers run before a non-zero exit.
+	defer func() {
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+	}()
 	configPath := flag.String("config", "config.yaml", "configuration file")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -66,14 +73,20 @@ func main() {
 	}()
 
 	server := &http.Server{Addr: cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	serverErrors := make(chan error, 1)
 	go func() {
 		log.Info("camera audit listening", "address", cfg.Listen, "frigate", cfg.FrigateURL)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error("HTTP server", "error", err)
-			stop()
+			serverErrors <- err
 		}
 	}()
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-serverErrors:
+		log.Error("HTTP server", "error", err)
+		exitCode = 1
+		stop()
+	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdown)

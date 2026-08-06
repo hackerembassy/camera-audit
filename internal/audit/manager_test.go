@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,14 +31,13 @@ func TestHostOnly(t *testing.T) {
 
 func TestBirdseyeUsesWebSocketLayoutBeforeFallback(t *testing.T) {
 	m := &Manager{
-		cfg:            config.Config{BirdseyeCameras: []string{"fallback"}},
-		sessions:       map[string]*model.ActiveSession{"birdseye/1": {Camera: "birdseye"}},
-		activities:     make(map[string]model.Activity),
-		liveHTTP:       make(map[int64]liveHTTP),
-		leases:         make(map[string]activityLease),
-		privacy:        make(map[string]bool),
-		zeroSince:      make(map[string]time.Time),
-		birdseyeLayout: make(map[string]struct{}),
+		cfg:        config.Config{BirdseyeCameras: []string{"fallback"}},
+		sessions:   map[string]*model.ActiveSession{"birdseye/1": {Camera: "birdseye"}},
+		activities: make(map[string]model.Activity),
+		liveHTTP:   make(map[int64]liveHTTP),
+		leases:     make(map[string]activityLease),
+		privacy:    make(map[string]bool),
+		zeroSince:  make(map[string]time.Time),
 	}
 	controlID := m.BirdseyeControlOpened()
 	m.UpdateBirdseyeLayout(controlID, []string{"workshop", "hall", "workshop", "birdseye", ""})
@@ -84,12 +84,34 @@ func TestBirdseyeLayoutExpiresWithSupplyingControlWebSocket(t *testing.T) {
 	}
 }
 
+func TestBirdseyeLayoutReturnsToLatestRemainingControlWebSocket(t *testing.T) {
+	m := &Manager{cfg: config.Config{BirdseyeCameras: []string{"fallback"}}}
+	first := m.BirdseyeControlOpened()
+	second := m.BirdseyeControlOpened()
+	m.UpdateBirdseyeLayout(first, []string{"hall"})
+	m.UpdateBirdseyeLayout(second, []string{"workshop"})
+	m.BirdseyeControlClosed(second)
+
+	current := m.Current()
+	if current.BirdseyeLayoutSource != "websocket" || !reflect.DeepEqual(current.BirdseyeLayout, []string{"hall"}) {
+		t.Fatalf("latest remaining WebSocket layout was not restored: %#v", current)
+	}
+}
+
 func TestHomeAssistantSignalMayHaveDifferentWebRTCPeerAddress(t *testing.T) {
 	now := time.Now()
 	m := &Manager{signals: []signal{{camera: "workshop", actor: "Home Assistant", actorType: "service", confidence: "correlated", remote: "10.0.0.2", userAgent: "HomeAssistant", at: now}}}
 	got, ok := m.matchSignal("workshop", "udp4 host 10.0.0.99:50000", "Mozilla/5.0", now.Add(time.Second))
 	if !ok || got.actor != "Home Assistant" {
 		t.Fatalf("service-side HA signal was not correlated: %#v %v", got, ok)
+	}
+}
+
+func TestPersonSignalDoesNotMatchAddressSubstring(t *testing.T) {
+	now := time.Now()
+	m := &Manager{signals: []signal{{camera: "workshop", actor: "alice", actorType: "person", confidence: "correlated", remote: "10.0.0.1", at: now}}}
+	if got, ok := m.matchSignal("workshop", "udp4 host 110.0.0.10:50000", "", now.Add(time.Second)); ok {
+		t.Fatalf("unrelated address was correlated: %#v", got)
 	}
 }
 
@@ -136,6 +158,73 @@ func TestRecordingPlaybackIsLeasedWithoutPrivacyAlert(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Kind != "recording_playback" || events[0].Details != "start=100 end=200" || !events[0].LastSeenAt.Equal(touched) {
 		t.Fatalf("unexpected playback events: %#v", events)
+	}
+}
+
+func TestConcurrentIdenticalRequestsCreateOneLease(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	m, err := New(config.Config{SnapshotLease: config.Duration(time.Minute)}, s, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for range 32 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			m.StartHTTP(context.Background(), "snapshot_live", "workshop", "", "alice", "person", "exact", "http", "192.0.2.1", "browser", now)
+		}()
+	}
+	close(start)
+	workers.Wait()
+
+	events, err := s.RecentFrigate(context.Background(), 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || len(m.leases) != 1 {
+		t.Fatalf("concurrent requests created %d events and %d leases", len(events), len(m.leases))
+	}
+}
+
+func TestRecordSignalPrunesExpiredHints(t *testing.T) {
+	now := time.Now().UTC()
+	m := &Manager{signals: []signal{{camera: "old", at: now.Add(-time.Minute)}}}
+	m.RecordSignal("current", "alice", "person", "correlated", "192.0.2.1", "browser", now)
+	if len(m.signals) != 1 || m.signals[0].camera != "current" {
+		t.Fatalf("expired signals were retained: %#v", m.signals)
+	}
+}
+
+func TestCloseTrackedEndsLiveHTTPRequest(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	m, err := New(config.Config{}, s, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 7, 0, 0, 0, time.UTC)
+	id := m.StartHTTP(context.Background(), "mse", "workshop", "", "alice", "person", "exact", "ws", "192.0.2.1", "browser", now)
+	if id == 0 {
+		t.Fatal("live request did not create an event")
+	}
+	m.closeTracked()
+	events, err := s.RecentFrigate(context.Background(), 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EndedAt == nil {
+		t.Fatalf("live request was not closed: %#v", events)
 	}
 }
 

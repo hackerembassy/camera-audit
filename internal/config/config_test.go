@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -70,5 +71,63 @@ func TestLoadRejectsConflictingFrigateTLSOptions(t *testing.T) {
 	}
 	if _, err := Load(p); err == nil {
 		t.Fatal("expected conflicting Frigate TLS settings to be rejected")
+	}
+}
+
+func TestLoadRejectsNonPositiveDurations(t *testing.T) {
+	for _, field := range []string{"poll_interval", "activity_window", "snapshot_lease", "privacy_clear_delay", "retention"} {
+		t.Run(field, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			data := []byte("frigate_url: https://frigate:8971\ngo2rtc_url: http://frigate:1984\ndatabase: audit.db\ntrusted_proxies: [127.0.0.0/8]\n" + field + ": 0s\n")
+			if err := os.WriteFile(p, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(p); err == nil || !strings.Contains(err.Error(), field) {
+				t.Fatalf("Load() error=%v, want error for %s", err, field)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidUpstreamURLs(t *testing.T) {
+	for _, tt := range []struct {
+		name, frigateURL, go2rtcURL string
+	}{
+		{name: "relative Frigate URL", frigateURL: "frigate:8971", go2rtcURL: "http://frigate:1984"},
+		{name: "unsupported go2rtc scheme", frigateURL: "https://frigate:8971", go2rtcURL: "ftp://frigate/streams"},
+		{name: "embedded credentials", frigateURL: "https://admin:secret@frigate:8971", go2rtcURL: "http://frigate:1984"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			data := []byte("frigate_url: " + tt.frigateURL + "\ngo2rtc_url: " + tt.go2rtcURL + "\ndatabase: audit.db\ntrusted_proxies: [127.0.0.0/8]\n")
+			if err := os.WriteFile(p, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(p); err == nil {
+				t.Fatal("expected invalid upstream URL to be rejected")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsIncompleteEnabledMQTT(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte("frigate_url: https://frigate:8971\ngo2rtc_url: http://frigate:1984\ndatabase: audit.db\ntrusted_proxies: [127.0.0.0/8]\nmqtt:\n  enabled: true\n")
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil {
+		t.Fatal("expected incomplete enabled MQTT configuration to be rejected")
+	}
+}
+
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte("frigate_url: https://frigate:8971\ngo2rtc_url: http://frigate:1984\ndatabase: audit.db\ntrusted_proxies: [127.0.0.0/8]\npoll_intervall: 2s\n")
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "poll_intervall") {
+		t.Fatalf("Load() error=%v, want unknown-field error", err)
 	}
 }
