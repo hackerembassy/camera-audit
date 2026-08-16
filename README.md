@@ -1,4 +1,4 @@
-# Camera access audit
+# Frigate camera access audit
 
 `camera-audit` records who accesses Frigate and which clients consume its bundled go2rtc streams. It also publishes state-only Home Assistant MQTT sensors so people in camera-equipped rooms can be warned when an unexpected viewer connects.
 
