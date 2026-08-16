@@ -23,6 +23,16 @@ Optional Telegram notifications cover recording playback, export requests, expor
 
 Frigate browser requests passing through Authentik have an exact username. WebRTC media bypasses the HTTP gateway after signaling, so its go2rtc session is marked `correlated`. Signaling and media may arrive through different Home Assistant or container-network addresses; the daemon may correlate them by camera and an exact, unambiguous browser user agent. An interactive browser with no forwarded username is recorded as an inferred `Browser viewer`, not as a backend service, but the daemon does not invent an individual identity. The standard Home Assistant Frigate integration itself calls Frigate using shared backend credentials and is still recorded as the `Home Assistant` service.
 
+## Screenshots
+
+![Dashboard web page "live" showing a list of cameras with their status, either clear or viewed now](https://github.com/hackerembassy/camera-audit/blob/main/docs/live.png?raw=true)
+
+![Dashboard web page showing a list of CCTV recording playback events with timestamps, camera name, time period and actor username](https://github.com/hackerembassy/camera-audit/blob/main/docs/history.png?raw=true)
+
+![Home Assistant screenshot with a list of cameras mirroring the live camera status dashboard](https://github.com/hackerembassy/camera-audit/blob/main/docs/hass.png)
+
+![Telegram audit message with a summary of recent CCTV recordings playback events. Contains multiple timestamps including accessed recordings time range, camera names and a username of the actor](https://github.com/hackerembassy/camera-audit/blob/main/docs/telegram.png?raw=true)
+
 ## Deployment
 
 1. Copy `config.example.yaml` to `config.yaml` and replace networks, camera names, and exclusion rules.
