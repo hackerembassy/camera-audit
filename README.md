@@ -26,7 +26,7 @@ Frigate browser requests passing through Authentik have an exact username. WebRT
 ## Deployment
 
 1. Copy `config.example.yaml` to `config.yaml` and replace networks, camera names, and exclusion rules.
-2. Add the service from `compose.example.yaml` to the Docker network that contains Frigate.
+2. Add the service from `compose.example.yaml` to the Docker network that contains Frigate. See example for full compose at `compose.with-frigate.example.yaml`.
    The audit container connects directly to the bundled go2rtc API at `http://frigate:1984`; no host port publication is needed when both containers share a Docker network.
 3. Protect the go2rtc API with HTTP Basic authentication. For bundled go2rtc, add this under Frigate's top-level `go2rtc` configuration, using secrets appropriate to your deployment:
 
