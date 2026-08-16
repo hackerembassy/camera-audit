@@ -1,0 +1,84 @@
+services:
+  camera-audit:
+    container_name: camera-audit
+    env_file:
+      - .env
+    build: ./audit/src/ # this repository is cloned here
+    restart: unless-stopped
+    networks:
+      - outpost
+      - frigate
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./audit/config.yaml:/config/config.yaml:ro
+      - ./audit/data:/data
+    environment:
+      CAMERA_AUDIT_MQTT_USERNAME: "${CAMERA_AUDIT_MQTT_USERNAME}"
+      CAMERA_AUDIT_MQTT_PASSWORD: "${CAMERA_AUDIT_MQTT_PASSWORD}"
+      CAMERA_AUDIT_FRIGATE_PROXY_SECRET: "${CAMERA_AUDIT_FRIGATE_PROXY_SECRET}"
+      CAMERA_AUDIT_GO2RTC_USERNAME: "${CAMERA_AUDIT_GO2RTC_USERNAME}"
+      CAMERA_AUDIT_GO2RTC_PASSWORD: "${CAMERA_AUDIT_GO2RTC_PASSWORD}"
+
+  go2rtc-homekit: # we have a homekit camera which requires another go2rtc with host network to proxy it for main go2rtc. only needed if you have homekit
+    image: ghcr.io/alexxit/go2rtc:latest
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./homekit:/config
+
+  authentik_proxy:
+    env_file:
+      - .env
+    restart: unless-stopped
+    image: ghcr.io/goauthentik/proxy:2026.5.6
+    networks:
+      - outpost
+    ports:
+      - 9000:9000
+      - 9443:9443
+    environment:
+      AUTHENTIK_HOST: "${AUTHENTIK_HOST}"
+      AUTHENTIK_INSECURE: "false"
+      AUTHENTIK_TOKEN: "${AUTHENTIK_TOKEN}"
+
+  frigate:
+    env_file:
+      - .env
+    container_name: frigate
+    privileged: true # this may not be necessary for all setups
+    restart: unless-stopped
+    image: ghcr.io/blakeblackshear/frigate:0.18.0-beta3
+    shm_size: "2048mb" # update for your cameras based on calculation above
+    devices:
+      - /dev/snd:/dev/snd # For intel hwaccel, needs to be updated for your hardware
+      - /dev/dri:/dev/dri # For intel hwaccel, needs to be updated for your hardware
+    networks:
+      - frigate
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./config:/config
+#      - ./nginx.conf:/usr/local/nginx/conf/nginx.conf
+      - /mnt/camdata/cctv:/media/frigate
+      - type: tmpfs # Optional: 5GB of memory, reduces SSD/SD Card wear
+        target: /tmp/cache
+        tmpfs:
+          size: 2147483648
+    ports:
+      - "1984:1984"
+      - "8554:8554" # RTSP feeds
+      - "8555:8555/tcp" # WebRTC over tcp
+      - "8555:8555/udp" # WebRTC over udp
+    environment:
+      FRIGATE_RTSP_PASSWORD: "${FRGT_RTSP_PASS}"
+
+networks:
+  outpost:
+    ipam:
+      config:
+        - subnet: 172.20.168.0/24
+  frigate:
+    ipam:
+      config:
+        - subnet: 172.20.169.0/24
